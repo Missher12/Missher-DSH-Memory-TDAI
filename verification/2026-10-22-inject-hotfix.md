@@ -49,6 +49,21 @@ in-repo plain-object mocks did not reproduce that guard.
 - 165,746 bytes
 - SHA-256 `30F759F48660B1B0B6F5A7A7EE11A4E0F06B2322FAC5750F56F79345263E93FE`
 
+## CI
+
+GitHub Actions run
+<https://github.com/Missher12/Missher-DSH-Memory-TDAI/actions/runs/39727122860>
+passed all 6 cells:
+
+| Runner | Node 22 | Node 24 |
+|---|---|---|
+| windows-latest | pass | pass |
+| macos-latest | pass | pass |
+| ubuntu-latest | pass | pass |
+
+Each cell ran `npm ci`, `npm run typecheck`, `npm test` (16/16), and
+`npm pack --dry-run`.
+
 ## Live-profile hotfix
 
 The already-installed copy at
@@ -69,6 +84,7 @@ reinstall of `0.1.0-local.1` through the Host plugin manager is the durable path
   cannot restart the running Host without killing itself.
 - Live Settings-page rendering.
 - Real-provider extraction/persona; tests still use a mock LLM.
-- macOS/Linux real-machine runs.
+- Physical macOS/Linux hardware beyond the GitHub-hosted CI runners; the CI
+  matrix itself passed on both.
 - A clean plugin-manager install of `0.1.0-local.1` and its persisted bundle
   entry; the first install left the dependency but no bundle entry.

@@ -36,7 +36,8 @@ A single-process, local-first long-term memory plugin for DSH 0.2.1-rc.2+:
 Local MVP (`0.1.0-local.1`). The Host side, the Settings dashboard RPC, the
 dashboard client bundle, L2 scene indexing, and L3 persona generation work and
 are covered by unit, hardening, tarball-install, and client-slot tests plus an
-Electron ABI 149 store/Cordis smoke test. L3 persona
+Electron ABI 149 store/Cordis smoke test and a six-cell GitHub Actions matrix
+(Windows/macOS/Ubuntu × Node 22/24). L3 persona
 generation is operator-triggered from the dashboard (one Host model call); once
 generated it is included with recalled facts when `recall.includePersona` is on.
 A global profile is opt-in (`persona.global`, default false), is generated only
@@ -157,6 +158,11 @@ $env:ELECTRON_RUN_AS_NODE = '1'
 & "D:\Deepseek-Harness\DeepSeek Harness.exe" --test tests/cordis-load.test.mjs
 & "D:\Deepseek-Harness\DeepSeek Harness.exe" scripts/electron-smoke.mjs
 ```
+
+GitHub Actions runs `npm ci`, `npm run typecheck`, `npm test`, and
+`npm pack --dry-run` on `windows-latest`, `macos-latest`, and `ubuntu-latest`
+with Node 22 and 24. The initial matrix passed 6/6:
+<https://github.com/Missher12/Missher-DSH-Memory-TDAI/actions/runs/39727122860>
 
 The tests use synthetic data and temporary directories only. A real DSH profile
 install and live Settings acceptance still require the Host plugin manager; they
