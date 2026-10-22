@@ -1,0 +1,11 @@
+node_modules/
+lib/
+dist/
+*.tgz
+*.log
+*.tsbuildinfo
+.DS_Store
+.tmp/
+.client-build/
+coverage/
+preview/render.cjs

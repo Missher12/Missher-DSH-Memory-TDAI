@@ -1,0 +1,12 @@
+﻿const path = require('path')
+const { chromium } = require('C:/Users/Missher-R2/.dsh/profiles/desktop/node_modules/playwright')
+;(async () => {
+  const browser = await chromium.launch({ headless: true, executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe' })
+  const page = await browser.newPage({ viewport: { width: 1280, height: 1100 }, deviceScaleFactor: 1 })
+  const file = 'file:///' + path.resolve('preview/dashboard.html').replace(/\\/g, '/')
+  await page.goto(file)
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: 'preview/dashboard.png', fullPage: true })
+  console.log('screenshot', await page.title())
+  await browser.close()
+})().catch((error) => { console.error(error); process.exit(1) })

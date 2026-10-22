@@ -1,0 +1,6 @@
+# dsh-memory-tdai — mounts the memory plugin into a profile layer stack.
+# Runtime defaults live at the plugin's own config boundary; override them by
+# adding a config row with the same id in the profile patch.
+- insert:
+    - id: memory-tdai
+      name: '@missher/dsh-memory-tdai'
