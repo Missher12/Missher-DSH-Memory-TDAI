@@ -23,17 +23,20 @@ export const L1_SYSTEM_PROMPT = `你是 Agent 的长期记忆抽取器。你的�
 - 大段工具输出、日志、代码本身。
 
 每条记忆必须是一句完整、可独立理解的中文陈述，合并重复内容。宁少勿滥。
+项目与会话只是来源，记忆供当前 profile 的后续会话共同参考。若同批来源或已有记忆存在未解决的矛盾，优先跳过；需要保留时必须输出 has_conflict: true，不能靠提高 confidence 掩盖冲突。
 最多输出 {{MAX}} 条。confidence 表示“这句话确实是用户/项目事实”的把握，0 到 1。
 
+生效时间规则：仅当来源明确给出事实开始时间时填写 valid_from；年、年月、年月日按原有精度输出字符串，例如 "2026"、"2026-04"、"2026-04-12"，完整带时区时间可输出 ISO 时间戳。来源明确说开始时间未知时填 null。没有谈到开始时间时省略 valid_from，沿用记录时间默认政策。绝不把记录时间或 0 当作未知。
+
 只返回严格 JSON，不要 markdown 代码围栏：
-{"memories":[{"content":"...","kind":"fact|preference|decision|project|next","confidence":0.0,"scene":"可选场景名","source_message_ids":["..."]}]}`
+{"memories":[{"content":"...","kind":"fact|preference|decision|project|next","confidence":0.0,"has_conflict":false,"scene":"可选场景名","valid_from":"2026-04","source_message_ids":["必须逐字选用 conversation 中方括号内的 source id"]}]}`
 
 export function buildL1UserPrompt(conversation: string, maxMemories: number, existing: string[]): string {
   const existingBlock =
     existing.length > 0
       ? `\n\n已有记忆（不要重复，若冲突请在 content 中说明是更新）：\n${existing.map((item) => `- ${item}`).join('\n')}`
       : ''
-  return `请从下面的对话中抽取 L1 记忆。\n\n<conversation>\n${conversation}\n</conversation>${existingBlock}\n\n最多 ${maxMemories} 条。`
+  return `请从下面的对话中抽取 L1 记忆。每条新记忆都必须引用至少一个可直接支持它的 source id，并且 source id 必须逐字复制自对话中每条消息开头的方括号；禁止编造、跨本批引用或使用短别名。无法定位来源的内容不要输出。\n\n<conversation>\n${conversation}\n</conversation>${existingBlock}\n\n最多 ${maxMemories} 条。`
 }
 
 export function systemPromptFor(maxMemories: number): string {

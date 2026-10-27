@@ -5,30 +5,23 @@ import path from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import * as plugin from '../lib/index.js'
+import { sourceAwareStream } from './helpers.mjs'
 
 test('plugin loads as a real Cordis plugin with injected Host services', async () => {
   const root = new Context()
   const temp = mkdtempSync(path.join(os.tmpdir(), 'tdai-cordis-'))
   const registeredTools = []
   const sections = []
-  const stream = async function* () {
-    yield {
-      type: 'text-delta',
-      index: 0,
-      text: '{"memories":[{"content":"用户偏好使用 pnpm 管理项目。","kind":"preference","confidence":0.93}]}',
-    }
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  }
   root.provide('tools', {
     register(definition) {
       registeredTools.push(definition)
       return () => {}
     },
   })
-  root.provide('llm', { stream: () => stream() })
+  root.provide('llm', { stream: sourceAwareStream((sourceIds) => ({ memories: [{ content: '用户偏好使用 pnpm 管理项目。', kind: 'preference', confidence: 0.93, source_message_ids: sourceIds }] })) })
   root.provide('sessions', {
     get() {
-      return { id: 's1', header: { cwd: temp }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }) }
+      return { id: 's1', header: { cwd: temp, agentPreset: 'agent-mock' }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }) }
     },
   })
   root.provide('systemPrompt', {
@@ -43,13 +36,14 @@ test('plugin loads as a real Cordis plugin with injected Host services', async (
   try {
     fiber = await root.plugin(
       { name: plugin.name, inject: plugin.inject, apply: plugin.apply },
-      { mode: 'balanced', autoApproveConfidence: 0.5, extraction: { everyNConversations: 1, minTurnChars: 0 } },
+      { mode: 'balanced', autoApproveConfidence: 0.5, extraction: { everyNConversations: 1, minTurnChars: 0 },
+        budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 } },
     )
     assert.ok(fiber)
-    assert.equal(registeredTools.length, 6)
+    assert.equal(registeredTools.length, 11)
     assert.equal(sections.length, 1)
 
-    const session = { id: 's1', header: { cwd: temp } }
+    const session = { id: 's1', header: { cwd: temp, agentPreset: 'agent-mock' }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }) }
     fiber.ctx.emit('session/event', session, {
       type: 'user/message',
       seq: 1,

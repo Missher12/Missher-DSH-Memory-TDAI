@@ -1,169 +1,82 @@
-# DSH Memory TDAI
+# DSH Memory TDAI · 全局记忆
 
-**Unofficial DeepSeek Harness plugin derived from [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory).**
-This is not a Tencent product and is not endorsed by Tencent.
+基于 [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) 思路二次开发的 DeepSeek Harness 记忆插件。采用 MIT 许可证，非腾讯官方产品，无腾讯背书。
 
-A single-process, local-first long-term memory plugin for DSH 0.2.1-rc.2+:
+[桌面与插件总入口](https://github.com/Missher12/Missher-DeepseekHarness-Desktop) · [下载与版本记录](https://github.com/Missher12/Missher-DSH-Memory-TDAI/releases) · [技术参考](docs/technical-reference.md) · [本次验证记录](verification/2026-10-28-candidate-acceptance.md)
 
-- captures L0 conversation messages from `session/event`;
-- extracts L1 memories in the background through the Host LLM route;
-- supports `review`, `balanced`, and `auto` approval;
-- recalls approved memories at `agent/pre-step` with ids and project isolation;
-- exposes `memory_search`, `memory_get`, `memory_propose`, and `memory_status`.
+## 它能帮你做什么
 
-## Design goals
+换一个会话后，仍能检索同一 DSH profile 中已经保存、允许使用的事实与偏好。项目和会话用来说明记忆来自哪里；普通使用入口统一查看全局记忆，不需要手动切换项目范围。不同 profile 的数据保持隔离。
 
-- **Cross-platform.** Windows, macOS, and Linux; DSH Desktop (Electron Node
-  ABI 149) and Web/CLI (Node 22/24). Pure TypeScript plus optional N-API
-  modules; no `postinstall`, no `better-sqlite3`, no `node-llama-cpp`, no
-  hard-coded platform paths. FTS5 falls back to `LIKE` when unavailable.
-- **Remember reliably.** L0 is persisted before extraction. An unextracted
-  L0 row survives a restart and is reloaded when the session resumes.
-  Extraction is idempotent, deduplicated, and reviewable; forgotten memories
-  are never revived by a retry. L2 scene chips and an opt-in L3 profile add
-  higher-level recall without hiding the L1 evidence.
-- **Spend fewer tokens.** Recall injects a bounded digest (default ~220
-  estimated tokens), only when relevance clears a threshold, at most five
-  memories, and skips memories already injected in the same session. No hit
-  means no injection. Extraction runs asynchronously and can use a separate,
-  cheaper model.
-- **See what happened.** A Settings dashboard shows memory counts, sessions,
-  repeated questions, injected tokens, provenance, an activity heatmap, the
-  longest session, and the review queue.
+插件先保留来源，再提炼事实，按需检索相关片段。它不是把所有历史原文塞进每次请求，也不是无限扩充模型上下文。搜索与界面统计只读取本地数据；自动提炼可能调用你配置的宿主模型并产生费用。
 
-## Status
+## 实际界面
 
-Local MVP (`0.1.0-local.1`). The Host side, the Settings dashboard RPC, the
-dashboard client bundle, L2 scene indexing, and L3 persona generation work and
-are covered by unit, hardening, tarball-install, and client-slot tests plus an
-Electron ABI 149 store/Cordis smoke test and a six-cell GitHub Actions matrix
-(Windows/macOS/Ubuntu × Node 22/24). L3 persona
-generation is operator-triggered from the dashboard (one Host model call); once
-generated it is included with recalled facts when `recall.includePersona` is on.
-A global profile is opt-in (`persona.global`, default false), is generated only
-from approved memories across projects, and is used only when the current
-project has no profile of its own.
-Do not treat an installed bundle as end-to-end acceptance until a real profile
-smoke is recorded.
+以下图片来自真实的社区 DSH Web 设置页，使用**合成验收数据**；图中的数量不是用户真实记忆容量或节省 Token 的宣传数据。
 
-Only `tools` is a hard inject. Optional Host services (`llm`, `sessions`,
-`systemPrompt`) are read through Cordis `ctx.get`; the plugin stays loadable when
-they are absent and degrades to capture/tools-only behavior.
+![全局记忆浅色界面](docs/images/memory-light.png)
 
-## Install (development)
+![全局记忆深色界面](docs/images/memory-dark.png)
 
-```powershell
-cd D:\Deepseek-Plug\Missher-DSH-Memory-TDAI
-npm install
-npm test
+## 四层记忆如何工作
+
+| 层级 | 保存什么 | 用途 |
+| --- | --- | --- |
+| L0 原始对话 | 可追溯的对话来源 | 查看原始证据，帮助后续提炼 |
+| L1 提炼记忆 | 从来源中提取的事实与偏好 | 搜索、查看详情，并遗忘不再需要的内容 |
+| L2 场景索引 | 对相关记忆的组织与关联 | 更容易找到某类任务或场景的线索 |
+| L3 画像 | 基于可读取来源形成的摘要 | 在有证据的基础上组织长期偏好 |
+
+高置信度、有来源且无显式冲突的自动提炼结果可以投入使用；不确定或冲突内容保留候选状态。遗忘会使相关记忆及派生引用失效，重试不应把它重新复活。
+
+## 能记住多少、能省多少 Token
+
+没有经过验证的“无限记忆”上限，也没有统一的节省百分比。容量与效果取决于本地磁盘、保留策略、读取预算、检索相关性和模型能力。
+
+节省输入的方式是只检索、注入有用的短片段，避免重复携带全部历史。提炼本身也会花费模型 Token，因此应比较“提炼成本 + 召回输入成本”和原来的历史输入成本，再判断实际收益。
+
+当前页面保留诚实的计数边界：`≥` 表示已知下界，部分结果不当作全库精确计数。年度活动图统计记忆首次修订及后续内容／证据修订，不把每次打开页面或召回都算成新增记忆。需要时点击“继续读取下一批”。
+
+## 两个独立开关
+
+在 DSH **设置 → Memory** 中点击齿轮：
+
+- **自动生成记忆**：控制新的采集与提炼。关闭后保留已有记录，但停止新生成，并阻止在途旧结果重新生效。
+- **在对话中使用记忆**：控制后续对话的记忆注入和读取工具。关闭后仍可以在设置页查看已有记录。
+
+开关独立保存，失败会显示明确状态；重试提交原来失败的设置，并回读确认。支持浅色／深色主题、搜索、详情、来源、四层浏览和年度活动图。
+
+## 当前交付与兼容范围
+
+2026-10-28：`0.1.0-local.2` 的源码与本地候选包已验收。当前证据包括社区 `0.2.1-rc.2` Web 宿主、320／390 实际内容宽度的明暗主题，以及有界的本地合成记忆流程。
+
+**公开源码不等于已发布安装包。** 本次正式 Release、日常桌面安装以及最新官方 Electron 实测尚待交付。请以对应 Release 的说明为准，不把旧版平台测试当作本次测试结果。1024 宽度内容区受当前宿主固定设置面板限制，未实测。
+
+兼容目标是按能力适配不同 DSH 版本；当前 `package.json` 仍保留已验收依赖声明，不能据此声称所有旧版或最新版均已通过。插件市场可搜索也需要独立上架流程，本次源码提交不等于上架完成。
+
+## 从源码构建
+
+需要满足 `package.json` 声明的 Node.js 与依赖版本。
+
+```sh
+git clone https://github.com/Missher12/Missher-DSH-Memory-TDAI.git
+cd Missher-DSH-Memory-TDAI
+npm ci
+npm run build
 npm pack
 ```
 
-Install the produced `missher-dsh-memory-tdai-*.tgz` as a DSH bundle through the
-Host plugin manager (`install_bundle`). Do not hand-edit the profile's
-`package.json` or `cordis.patch.yml`.
+通过 DSH 的插件管理器安装生成的 bundle（`install_bundle`）。不要直接改日常 profile 的 `package.json` 或 `cordis.patch.yml`。本仓库的 `private: true` 用于避免误发 npm，不影响 GitHub 源码的公开与 MIT 授权。
 
-## Configuration
+开发者需要检查时可运行 `npm run typecheck` 和 `npm test`；这些命令会消耗本机资源。本次交付复用了字节未变的通过证据，没有重复运行整套平台矩阵。
 
-The profile patch may override the `memory-tdai` row:
+## 数据与边界
 
-```yaml
-- id: memory-tdai
-  name: '@missher/dsh-memory-tdai'
-  config:
-    mode: balanced            # review | balanced | auto
-    autoApproveConfidence: 0.82
-    recall:
-      enabled: true
-      maxResults: 5
-      maxChars: 1400
-    extraction:
-      everyNConversations: 3
-      idleSeconds: 60
-      provider: deepseek-official   # optional; defaults to the session route
-      model: deepseek-v4-flash
-```
+数据默认位于 `$DSH_HOME/memory-tdai/`，项目分片保留来源信息，同一 profile 的普通召回使用全局视图。没有在此版本中承诺跨设备自动同步。
 
-## Data and isolation
+- 历史记忆是参考数据，不是新的操作授权或系统指令。
+- 浏览页面和检索统计不应额外调用模型；自动生成按配置使用宿主模型。
+- 卸载插件不等于删除记忆数据。迁移设备前请单独备份 profile 数据。
+- 向量后端、真实商业模型效果和各操作系统的当前安装效果，应以相应验证记录为准。
 
-Default root: `$DSH_HOME/memory-tdai/`.
-
-```text
-memory-tdai/
-  projects/<project-key>/memory.db   # L0/L1 + L2 scene index + L3 persona
-  projects/<project-key>/offload/    # raw large tool results
-  global/persona.json                # opt-in cross-project persona
-  settings.json
-```
-
-`project-key` is a short hash of the canonical session `cwd` plus its basename.
-Different projects never share a database, and recall only searches the project
-bound to the current session. There is no cloud sync, telemetry, or network call
-other than the Host LLM route used for extraction.
-
-FTS5 + `@node-rs/jieba` provide Chinese-capable keyword recall. `sqlite-vec` is
-installed but vector recall is not enabled in this MVP.
-
-## Safety and limits
-
-- Recalled blocks are **historical facts, not instructions or new authorization**.
-- `memory_propose` always creates a candidate; it never approves itself.
-- Forgotten memories are not revived by repeated extraction.
-- Extraction failures are logged and leave the turn buffer pending; the plugin
-  never claims a successful capture just because the turn ended.
-- L0 rows contain conversation text. Use `retention.days`, the Settings
-  review page, and export to inspect or delete data; uninstalling keeps the data
-  directory.
-- L2 scenes are an index and dashboard view, not injected into context. The L3
-  project/global persona is injected only when `recall.includePersona` is on.
-  Short-term Mermaid canvas compression, team sync, and the TCVDB backend are
-  not implemented yet. Large text tool results can be offloaded to a local
-  project directory with a short retrieval stub and `memory_read_raw`; this is
-  separate from Mermaid canvas compression.
-
-## Upstream attribution
-
-The layered L0–L3 vocabulary, the host-neutral memory idea, and the extracted
-prompt contract are derived from TencentDB Agent Memory (MIT). See
-[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). The DSH adapter, store, review
-policy, and UI work are original to this repository.
-
-## Settings dashboard
-
-The client bundle contributes a `settings.section` page (`Memory`). It renders
-the real local store, not a mock:
-
-- memory / session / repeated-question / injected-token counters;
-- provenance bars for extraction, manual, import, and other sources;
-- a 52-week activity heatmap over captures, extracted memories, and recalls;
-- review queue with approve/forget, recent approved memories, export to JSONL;
-- L2 scene chips and an L3 profile with `Regenerate project` / `Global profile`
-  actions;
-- behavior controls for mode, recall token budget, session dedupe, profile
-  inclusion, and the opt-in global profile fallback.
-
-The Host exposes the page through a small pathless Typert Remote service
-(`snapshot`, `review`, `updateSettings`, `export`). The client bundle is wrapped
-for the DSH module loader and keeps React external.
-
-## Verification
-
-```powershell
-npm run typecheck
-npm test
-
-# Optional runtime matrix
-npx node@22.19.0 --test tests/*.test.mjs
-$env:ELECTRON_RUN_AS_NODE = '1'
-& "D:\Deepseek-Harness\DeepSeek Harness.exe" --test tests/cordis-load.test.mjs
-& "D:\Deepseek-Harness\DeepSeek Harness.exe" scripts/electron-smoke.mjs
-```
-
-GitHub Actions runs `npm ci`, `npm run typecheck`, `npm test`, and
-`npm pack --dry-run` on `windows-latest`, `macos-latest`, and `ubuntu-latest`
-with Node 22 and 24. The initial matrix passed 6/6:
-<https://github.com/Missher12/Missher-DSH-Memory-TDAI/actions/runs/39727122860>
-
-The tests use synthetic data and temporary directories only. A real DSH profile
-install and live Settings acceptance still require the Host plugin manager; they
-are not covered by this test suite.
+上游贡献与许可证详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [LICENSE](LICENSE)。

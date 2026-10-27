@@ -1,6 +1,6 @@
 {
   "name": "@missher/dsh-memory-tdai",
-  "version": "0.1.0-local.1",
+  "version": "0.1.0-local.2",
   "private": true,
   "description": "Unofficial DSH native memory plugin derived from TencentDB Agent Memory (L0-L3)",
   "keywords": [
@@ -78,7 +78,7 @@
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsc -p tsconfig.build.json",
     "build:client": "node scripts/build-client.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "pack": "npm pack"
   },

@@ -9,13 +9,87 @@
  */
 
 import { createHash } from 'node:crypto'
+import { lstatSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { isValidProjectKey, MAX_PROJECT_KEY_LENGTH } from './project-key.js'
+
+export { isValidProjectKey, MAX_PROJECT_KEY_LENGTH } from './project-key.js'
 
 export interface ProjectIdentity {
   key: string
   name: string
   cwd: string
+}
+
+export function validProjectKeyOrThrow(key: unknown): asserts key is string {
+  if (!isValidProjectKey(key)) {
+    throw new Error(`invalid project key: ${JSON.stringify(key)}`)
+  }
+}
+
+function isWithin(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}${path.sep}`)
+}
+
+/**
+ * Builds the memory.db path for a project, enforcing the containment and
+ * symlink boundary around `<root>/projects/<key>`.
+ *
+ * - the key must pass {@link isValidProjectKey};
+ * - the resolved file must stay inside `<root>/projects`;
+ * - when the project directory already exists, its real path (after symlink
+ *   resolution) must also stay inside the real path of `<root>/projects`, so a
+ *   pre-planted symlink cannot redirect a project database outside the store;
+ * - when the database file itself already exists as a symlink, its target must
+ *   stay inside the store; a dangling `memory.db` symlink is rejected so the
+ *   opener never creates a database over it.
+ *
+ * @throws when the key is invalid or the resolved location escapes the store.
+ */
+export function projectDbPath(root: string, projectKey: string): string {
+  validProjectKeyOrThrow(projectKey)
+  const projectsRoot = path.resolve(root, 'projects')
+  const dir = path.join(projectsRoot, projectKey)
+  const file = path.join(dir, 'memory.db')
+  if (!isWithin(projectsRoot, file)) throw new Error(`project path escapes the store root: ${JSON.stringify(projectKey)}`)
+  let realRoot = projectsRoot
+  try {
+    realRoot = realpathSync(projectsRoot)
+  } catch {
+    // The projects root may not exist yet; containment against the literal path still holds.
+  }
+  if (lstatSync(dir, { throwIfNoEntry: false }) !== undefined) {
+    let realDir: string
+    try {
+      realDir = realpathSync(dir)
+    } catch {
+      throw new Error(`project directory is not readable: ${JSON.stringify(projectKey)}`)
+    }
+    if (!isWithin(realRoot, realDir)) {
+      throw new Error(`project directory escapes the store root: ${JSON.stringify(projectKey)}`)
+    }
+  }
+  try {
+    const stat = lstatSync(file)
+    if (stat.isSymbolicLink()) {
+      // Resolve the *target*; a broken link throws ENOENT here and must not be
+      // silently replaced by a fresh database file.
+      let realFile: string
+      try {
+        realFile = realpathSync(file)
+      } catch {
+        throw new Error(`project database is a dangling symlink: ${JSON.stringify(projectKey)}`)
+      }
+      if (!isWithin(realRoot, realFile)) {
+        throw new Error(`project database escapes the store root: ${JSON.stringify(projectKey)}`)
+      }
+    }
+  } catch (error) {
+    // ENOENT is the normal case for a fresh project (no database yet).
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
+  return file
 }
 
 export function resolveDshHome(configured?: string): string {

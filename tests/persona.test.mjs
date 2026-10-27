@@ -15,14 +15,18 @@ test('L3 persona generation uses approved memories and appears in the dashboard'
   try {
     const project = projectIdentity(process.cwd())
     const store = openProjectStore(root, project.key, project)
-    for (const content of ['用户偏好 TypeScript。', '插件必须跨平台。', '记忆需要先审核再注入。']) {
-      store.addMemory({ content, kind: 'preference', confidence: 0.9, status: 'approved', scene: 'workflow' })
+    for (const [index, content] of ['用户偏好 TypeScript。', '插件必须跨平台。', '记忆需要先审核再注入。'].entries()) {
+      const sourceId = store.recordL0({ sessionId: 'persona-source', role: 'user', content: `Synthetic source ${index}: ${content}` })
+      store.addMemory({ content, kind: 'preference', confidence: 0.9, status: 'approved', scene: 'workflow',
+        sourceMessageIds: [sourceId], sourceVerified: true })
     }
+    store.refreshScenes()
     store.close()
     const personaText = '## 核心特征\n一位偏好 TypeScript 和跨平台方案的插件作者。\n\n## 工作方式\n- 记忆先审核。'
     const streaming = async function* () {
       yield { type: 'text-delta', index: 0, text: personaText.slice(0, 20) }
       yield { type: 'text-delta', index: 0, text: personaText.slice(20) }
+      yield { type: 'usage', usage: { inputTokens: 320, outputTokens: 75 } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     }
     runtime = new MemoryRuntime(
@@ -31,7 +35,7 @@ test('L3 persona generation uses approved memories and appears in the dashboard'
         llm: { stream: () => streaming() },
         get() { return undefined },
       },
-      resolveConfig({ extraction: { provider: 'mock', model: 'mock' } }),
+      resolveConfig({ extraction: { provider: 'mock', model: 'mock' }, budget: { manualDailyTokens: 1_000_000, manualDailyTasks: 100 } }),
       root,
     )
     const persona = await runtime.refreshPersona(project.key)

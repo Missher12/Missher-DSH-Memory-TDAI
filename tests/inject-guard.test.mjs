@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { apply } from '../lib/index.js'
+import { sourceAwareStream } from './helpers.mjs'
 
 /**
  * Mimic the Cordis fiber guard: optional services are available through
@@ -58,16 +59,8 @@ test('optional Host services are read through ctx.get, not direct properties', a
   try {
     const session = {
       id: 's1',
-      header: { cwd },
+      header: { cwd, agentPreset: 'agent-mock' },
       requestHeader: () => ({ config: { provider: 'mock', model: 'mock-model' } }),
-    }
-    const streaming = async function* () {
-      yield {
-        type: 'text-delta',
-        index: 0,
-        text: '{"memories":[{"content":"用户偏好使用 pnpm 管理前端项目。","kind":"preference","confidence":0.93}]}',
-      }
-      yield { type: 'finish', reason: { kind: 'stop' } }
     }
     const services = {
       dshHomePath: (...segments) => path.join(root, ...segments),
@@ -80,7 +73,7 @@ test('optional Host services are read through ctx.get, not direct properties', a
         },
       },
       sessions: { get: () => session },
-      llm: { stream: () => streaming() },
+      llm: { stream: sourceAwareStream((sourceIds) => ({ memories: [{ content: '用户偏好使用 pnpm 管理前端项目。', kind: 'preference', confidence: 0.93, source_message_ids: sourceIds }] })) },
     }
     const guarded = guardedContext(services)
     disposers = guarded.disposers
@@ -89,9 +82,10 @@ test('optional Host services are read through ctx.get, not direct properties', a
       mode: 'balanced',
       autoApproveConfidence: 0.5,
       extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0 },
+      budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 },
       recall: { enabled: true, minScore: 0 },
     })
-    assert.equal(guarded.tools.length, 6)
+    assert.equal(guarded.tools.length, 11)
 
     const emit = (event) => Promise.all((guarded.listeners.get('session/event') ?? []).map((listener) => listener(session, event)))
     await emit({
