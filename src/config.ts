@@ -55,7 +55,7 @@ export interface MemoryTdaiConfig {
     /** Hard upper bound for one pending batch's wait; new events never reset it. @default 21600 */
     maxWaitSeconds?: number
   }
-  /** Explicit token/task ceilings for every chargeable memory-service call. Zero keeps that class paused. */
+  /** @deprecated Legacy daily quotas are accepted on input and ignored. */
   budget?: {
     automaticDailyTokens?: number
     automaticDailyTasks?: number
@@ -128,7 +128,6 @@ export interface ResolvedConfig {
     minTurnChars: number
     maxWaitSeconds: number
   }
-  budget: { automaticDailyTokens: number; automaticDailyTasks: number; manualDailyTokens: number; manualDailyTasks: number }
   recall: { enabled: boolean; maxResults: number; maxTokens: number; maxChars: number; minScore: number; dedupeSession: boolean; includePersona: boolean }
   retention: { days: number }
   persona: { global: boolean }
@@ -212,12 +211,6 @@ export function resolveConfig(raw: MemoryTdaiConfig | undefined): ResolvedConfig
       maxTokens: numberIn(input.extraction?.maxTokens, 1200, 128, 16_000),
       minTurnChars: numberIn(input.extraction?.minTurnChars, 40, 0, 100_000),
       maxWaitSeconds: numberIn(input.extraction?.maxWaitSeconds, 21_600, 60, 604_800),
-    },
-    budget: {
-      automaticDailyTokens: numberIn(input.budget?.automaticDailyTokens, 0, 0, 10_000_000),
-      automaticDailyTasks: numberIn(input.budget?.automaticDailyTasks, 0, 0, 100_000),
-      manualDailyTokens: numberIn(input.budget?.manualDailyTokens, 0, 0, 10_000_000),
-      manualDailyTasks: numberIn(input.budget?.manualDailyTasks, 0, 0, 100_000),
     },
     recall: {
       enabled: bool(input.recall?.enabled, true),

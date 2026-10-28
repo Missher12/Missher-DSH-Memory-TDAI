@@ -17,7 +17,15 @@ export function memoryYear(year, timeZone, days, complete, now = Date.now()) {
   const firstWeekday = (new Date(start).getUTCDay() + 6) % 7
   const recent = cells.filter((cell) => !cell.future &&
     Date.parse(`${today}T00:00:00Z`) - Date.parse(`${cell.date}T00:00:00Z`) < 30 * 86400000)
-  return { cells, firstWeekday, weeks: Math.ceil((firstWeekday + cells.length) / 7),
+  const weeks = Math.ceil((firstWeekday + cells.length) / 7)
+  const grid = Array.from({ length: weeks * 7 }, (_, index) => cells[index - firstWeekday] ?? null)
+  const months = Array.from({ length: 12 }, (_, month) => {
+    const offset = (Date.UTC(year, month, 1) - start) / 86400000
+    const next = month === 11 ? weeks : Math.floor((firstWeekday + (Date.UTC(year, month + 1, 1) - start) / 86400000) / 7)
+    const column = Math.floor((firstWeekday + offset) / 7)
+    return { month: month + 1, column: column + 1, span: Math.max(1, next - column) }
+  })
+  return { cells, grid, months, firstWeekday, weeks,
     recentAdded: recent.reduce((sum, cell) => sum + cell.added, 0), recentComplete: complete }
 }
 export function memoryMetric(metric) {
@@ -44,7 +52,7 @@ export function readGlobalMemory(transport, request, cancelled = () => false) {
         if (!readId) throw new Error('读取凭据缺失')
         current = await transport({ version: 1, action: 'continue', readId, cursor: current.cursor })
       }
-      throw new Error('读取达到总预算上限')
+      throw new Error('本批读取达到工作上限，请继续读取下一批')
     } finally {
       if (readId) {
         try {
@@ -66,7 +74,7 @@ export function readGlobalMemory(transport, request, cancelled = () => false) {
 }
 
 
-/** One immutable failed switch intent per mounted transport; only an explicit retry writes again. */
+/** One immutable failed settings intent per mounted transport; only an explicit retry writes again. */
 export function createMemorySettingsMutation(actions) {
   const updateSettingsAck = actions.updateSettingsAck
   const controller = createSettingsReadController({ readDashboard: actions.readDashboard, updateSettingsAck: async (patch) => {
@@ -79,9 +87,8 @@ export function createMemorySettingsMutation(actions) {
   const send = async (patch) => {
     if (!controller.isActive() || busy || patch === undefined) return { kind: 'ignored' }
     const keys = Object.keys(patch)
-    if (keys.length !== 1 || !['generateMemory', 'useMemory'].includes(keys[0]) || typeof patch[keys[0]] !== 'boolean') {
-      return { kind: 'ignored' }
-    }
+    const switchPatch = keys.length === 1 && ['generateMemory', 'useMemory'].includes(keys[0]) && typeof patch[keys[0]] === 'boolean'
+    if (!switchPatch) return { kind: 'ignored' }
     const intent = Object.freeze({ ...patch }), started = controller.startSave(intent)
     if (!started.started) return { kind: 'ignored' }
     busy = true
@@ -89,7 +96,7 @@ export function createMemorySettingsMutation(actions) {
       const result = await started.promise
       if (!controller.isActive() || result.kind === 'ignored') return { kind: 'ignored' }
       if (result.kind !== 'saved' || typeof result.settings.generateMemory !== 'boolean' ||
-          typeof result.settings.useMemory !== 'boolean' || result.settings[keys[0]] !== intent[keys[0]]) {
+          typeof result.settings.useMemory !== 'boolean' || keys.some((key) => result.settings[key] !== intent[key])) {
         failed = intent
         return { kind: 'failed' }
       }

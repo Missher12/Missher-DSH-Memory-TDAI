@@ -1,6 +1,6 @@
 {
   "name": "@missher/dsh-memory-tdai",
-  "version": "0.1.0-local.2",
+  "version": "0.1.1",
   "private": true,
   "description": "Unofficial DSH native memory plugin derived from TencentDB Agent Memory (L0-L3)",
   "keywords": [
@@ -60,7 +60,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-rc.2",
     "react": "^18.2.0"
   },
   "peerDependenciesMeta": {

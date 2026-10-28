@@ -16,7 +16,6 @@ test('settings read accepts only a real ok settings result and keeps failure/cle
   const ready = { version: 1, status: 'ok', complete: true, generatedAt: 1,
     readId: '00000000-0000-4000-8000-000000000001',
     settings: { mode: 'review', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-      automaticDailyTokens: 0, automaticDailyTasks: 0, manualDailyTokens: 0, manualDailyTasks: 0,
       includePersona: true, globalPersona: false } }
   assert.equal(isSuccessfulSettingsRead(ready), true)
   assert.equal(settingsReadId(ready), ready.readId)
@@ -83,7 +82,6 @@ function deferred() {
 function settingsResult(readId, overrides = {}) {
   return { version: 1, status: 'ok', complete: true, generatedAt: 1, readId,
     settings: { mode: 'review', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-      automaticDailyTokens: 0, automaticDailyTasks: 0, manualDailyTokens: 0, manualDailyTasks: 0,
       includePersona: true, globalPersona: false, ...(overrides.settings ?? {}) },
     ...(overrides.lastErrorState === undefined ? {} : { lastErrorState: overrides.lastErrorState }),
     ...(overrides.lastError === undefined ? {} : { lastError: overrides.lastError }),
@@ -333,4 +331,11 @@ test('an old save finally cannot clear a newer lifecycle save busy flag', async 
   const duplicateNew = controllerTwo.startSave({ mode: 'auto' })
   assert.equal(duplicateNew.started, false)
   assert.equal(duplicateNew.reason, 'in-flight')
+})
+
+
+test('Memory settings expose switches and context controls without daily quota forms', () => {
+  assert.doesNotMatch(dashboard, /automaticDailyTokens|automaticDailyTasks|manualDailyTokens|manualDailyTasks|保存预算|mv7-budget/u)
+  assert.match(dashboard, /在对话中使用记忆/u)
+  assert.match(dashboard, /重试保存/u)
 })

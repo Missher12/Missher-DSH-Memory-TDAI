@@ -26,7 +26,7 @@ test('runtime captures a turn, extracts L1, auto-approves in balanced mode, and 
     const config = resolveConfig({
       mode: 'balanced',
       autoApproveConfidence: 0.5,
-      extraction: { minTurnChars: 0, enabled: true, everyNConversations: 1 },
+      extraction: { minTurnChars: 0, enabled: true, everyNConversations: 1, provider: 'mock', model: 'mock-model' },
       budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 },
       recall: { enabled: true, minScore: 0 },
     })

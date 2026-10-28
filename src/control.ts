@@ -1115,34 +1115,20 @@ export class ControlLedger {
     return this.settleAttempt(id, disposition === 'charged' ? 'blocked_charged' : 'confirmed_not_charged', undefined, undefined, now)
   }
 
-  /** Atomically reserve a global one-call slot and explicit daily token/task caps. */
+  /** Atomically reserve the single active call; legacy daily limits are ignored. */
   reserveBillableCall(input: {
     id: string; projectKey: string; purpose: string; budgetClass: 'automatic' | 'manual';
-    reservedTokens: number; dailyTokenLimit: number; dailyTaskLimit: number; now?: number;
+    reservedTokens: number; dailyTokenLimit?: number; dailyTaskLimit?: number; now?: number;
     jobId?: string; attemptId?: string; provider?: string; model?: string; requestHash?: string;
   }): BillableCall {
     this.ensureOpen()
     const now = input.now ?? Date.now()
     const tokens = Math.max(1, Math.floor(input.reservedTokens))
-    const tokenLimit = Math.max(0, Math.floor(input.dailyTokenLimit))
-    const taskLimit = Math.max(0, Math.floor(input.dailyTaskLimit))
-    if (tokenLimit === 0 || taskLimit === 0) throw new Error(`${input.budgetClass} daily token and task budgets must be explicitly configured before billable requests`)
-    if (tokens > tokenLimit) throw new Error(`estimated request reservation ${tokens} tokens exceeds the configured daily ${input.budgetClass} budget ${tokenLimit}`)
-    const startOfUtcDay = Math.floor(now / 86_400_000) * 86_400_000
-    const endOfUtcDay = startOfUtcDay + 86_400_000
     this.db.exec('BEGIN IMMEDIATE')
     try {
       this.assertWriterEpoch()
       const active = this.db.prepare("SELECT id, state FROM billable_calls WHERE state IN ('reserved', 'dispatching', 'uncertain') OR response_status = 'saved' LIMIT 1").get() as { id?: string; state?: string } | undefined
       if (active !== undefined) throw new Error(`global billable request gate is held by ${String(active.id)} (${String(active.state)}, response ${String(this.getBillableCall(String(active.id))?.responseStatus ?? 'none')})`)
-      const totals = this.db.prepare(
-        `SELECT COUNT(*) AS tasks, COALESCE(SUM(CASE WHEN actual_tokens IS NULL THEN reserved_tokens ELSE actual_tokens END), 0) AS tokens
-         FROM billable_calls WHERE budget_class = ? AND created_at >= ? AND created_at < ? AND state <> 'cancelled'`,
-      ).get(input.budgetClass, startOfUtcDay, endOfUtcDay) as { tasks?: number; tokens?: number }
-      const usedTasks = Number(totals?.tasks ?? 0)
-      const usedTokens = Number(totals?.tokens ?? 0)
-      if (usedTasks >= taskLimit) throw new Error(`daily ${input.budgetClass} task limit reached (${usedTasks}/${taskLimit})`)
-      if (usedTokens + tokens > tokenLimit) throw new Error(`daily ${input.budgetClass} token budget exhausted (${usedTokens}+${tokens}/${tokenLimit})`)
       this.db.prepare(
         `INSERT INTO billable_calls(id, project_key, purpose, budget_class, state, reserved_tokens, job_id, attempt_id, provider, model, request_hash, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?)`,

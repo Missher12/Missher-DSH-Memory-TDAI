@@ -24,7 +24,7 @@ The gear exposes only **自动生成记忆** and **在对话中使用记忆**. T
 turning off generation stops new capture/extraction and invalidates in-flight
 acceptance, while turning off use removes memory from subsequent conversation
 packets and blocks memory-reading tools. Existing records remain browseable.
-Initial legacy capture/extraction/recall disables are reflected in the effective switches; deliberately enabling a switch persists its corresponding subgates. Zero automatic budgets still pause generation. High-confidence automatic
+Initial legacy capture/extraction/recall disables are reflected in the effective switches; deliberately enabling a switch persists its corresponding subgates. Legacy daily quota inputs are ignored; they do not pause generation. High-confidence automatic
 extraction no longer waits for a manual approval screen; uncertain or explicitly
 conflicting outputs remain candidates, and repeated forgotten records stay forgotten.
 
@@ -62,7 +62,7 @@ A successful extraction batch now refreshes L3 without an additional model call:
 at most eight currently readable, high-confidence approved facts/preferences,
 with bounded bodies and sources, are projected deterministically. Current source
 revisions are saved and rechecked; forgetting, revocation and revisions invalidate
-the derived result. Generation disables, zero budgets and stale in-flight policy
+the derived result. Generation disables and stale in-flight policy
 snapshots cannot authorize this update. Browsing/search/statistics remain model-free.
 
 No database migration, live profile edit, installation or release is part of this
@@ -324,9 +324,9 @@ the real local store, not a mock:
 - L2 scene chips and an L3 profile with `Regenerate project` / `Global profile`
   actions;
 - behavior controls for mode, recall token budget, session dedupe, profile
-  inclusion, extraction pause, and explicit daily task/token budgets;
+  inclusion and explicit extraction pause; no plugin daily task/token quotas;
 - project-local task continuity, experience cards, revision/relation review,
-  decision impact, synthetic retrieval evaluation, budget audit, and recovery
+  decision impact, synthetic retrieval evaluation, recorded-usage audit, and recovery
   snapshots with a verified-plan-gated apply action.
 
 The Host exposes the page through a pathless Typert Remote service for snapshots,
@@ -342,3 +342,19 @@ do not use an old build, tarball, CI run, or installed bundle as proof for this
 candidate. Official Host loading, native Settings interaction, real provider
 usage reconciliation, package digest, release, and installation each require
 their own evidence and are not implied by source or offline tests.
+
+
+## Unmetered Memory source candidate (2026-10-28)
+
+Daily automatic/manual token and task quotas have been removed. Legacy zero or
+small values are ignored on input and dropped from restored settings; current
+settings responses and UI contain no quota controls. The control ledger still
+records actual usage, deduplicates request identities, and holds its single-call
+gate for unresolved requests. Unknown remote outcomes do not authorize retries.
+Legacy quota-error jobs retain ordinary retry backoff, without a next-day wait.
+
+Global recall has no 150ms scan stop or 250ms whole-packet discard. Elapsed time is
+only diagnostic. Finite paging/candidate/context limits and current identity,
+source/head/body/publication proofs remain. These read boundaries are not a
+cumulative storage quota. Explicit disables, retention policies and forgetting
+remain effective. This source candidate has not been compiled or tested yet.

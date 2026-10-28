@@ -934,12 +934,17 @@ test('ready extraction retry backoff survives reopening without moving its sourc
     assert.equal(store.nextActionableExtractionJob('retry-session', now + 10_000), undefined)
     assert.equal(store.nextActionableExtractionJob('retry-session', now + 10_000, true)?.status, 'ready', 'a released billable gate may wake its blocked job early')
     assert.equal(store.nextActionableExtractionJob('retry-session', now + 35_000)?.status, 'ready')
-    const budgetBlockedAt = now + 40_000
-    const nextUtcDay = (Math.floor(budgetBlockedAt / 86_400_000) + 1) * 86_400_000
-    store.deferReadyExtractionJob(ready.id, 'daily automatic task limit reached (1/1)', budgetBlockedAt)
-    assert.equal(store.nextExtractionDueAt('retry-session'), nextUtcDay)
-    assert.equal(store.nextActionableExtractionJob('retry-session', nextUtcDay - 1), undefined)
-    assert.equal(store.nextActionableExtractionJob('retry-session', nextUtcDay)?.status, 'ready')
+    const legacyErrors = ['daily automatic task limit reached (1/1)', 'daily manual token budget exhausted (1+100/1)',
+      'estimated request reservation 100 tokens exceeds the configured daily automatic budget 1',
+      'automatic daily token and task budgets must be explicitly configured before billable requests']
+    for (const [index, error] of legacyErrors.entries()) {
+      const blockedAt = now + 40_000 + index * 60_000, dueAt = blockedAt + 30_000
+      store.deferReadyExtractionJob(ready.id, error, blockedAt)
+      store.close(); store = openProjectStore(root, projectKey)
+      assert.equal(store.nextExtractionDueAt('retry-session'), dueAt, 'legacy quota errors retain only ordinary retry backoff after restart')
+      assert.equal(store.nextActionableExtractionJob('retry-session', dueAt - 1), undefined)
+      assert.equal(store.nextActionableExtractionJob('retry-session', dueAt)?.status, 'ready', 'no daily quota delays the job until midnight')
+    }
   } finally {
     store.close()
     rmSync(root, { recursive: true, force: true })
@@ -1377,4 +1382,61 @@ test('store experience matching propagates truncated environment and prerequisit
     store?.close()
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+
+test('committed route binding splits only same-session same-turn sources and preserves frozen provenance', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-proof-'))
+  let store = openProjectStore(root, 'route-proof')
+  const now = Date.now()
+  try {
+    const capture = (id, sessionId = 's1') => store.captureMessage({ sessionId, role: 'user', content: `Synthetic source ${id}`,
+      createdAt: now, sourceEventId: id, agentPreset: 'agent-mock' }).id
+    const unknown = capture('unknown'), first = capture('first'), later = capture('later'), other = capture('other', 's2')
+    store.recordSourceRequestContext({ sourceId: first, sessionId: 's1', turn: 1, step: 1, seq: 3 })
+    store.recordSourceRequestContext({ sourceId: later, sessionId: 's1', turn: 2, step: 1, seq: 8 })
+    store.recordSourceRequestContext({ sourceId: other, sessionId: 's2', turn: 1, step: 1, seq: 3 })
+    const queue = (sourceId) => store.enqueueExtractionJob({ sessionId: 's1', sourceId, policyRevision: 'v1', quietMs: 0, maxWaitMs: 60000, now })
+    const original = queue(unknown); queue(first); queue(later)
+    assert.equal(store.nextActionableExtractionJob('s1', now), undefined)
+    assert.equal(store.nextExtractionDueAt('s1'), undefined, 'route-less queue does not create a polling loop')
+    const commit = { sessionId: 's1', turn: 1, step: 1, seq: 4, kind: 'request/header', provider: 'mock', model: 'first' }
+    assert.equal(store.bindCommittedSourceRoute({ ...commit, seq: 2 }), 0, 'a header older than capture proves nothing')
+    assert.equal(store.bindCommittedSourceRoute({ ...commit, step: 2 }), 0, 'another step cannot claim a source')
+    assert.equal(store.bindCommittedSourceRoute(commit), 1)
+    const runnable = store.nextActionableExtractionJob('s1', now)
+    assert.deepEqual(runnable.sourceIds, [first]); assert.equal(runnable.model, 'first')
+    assert.deepEqual(store.getExtractionJob(original.id).sourceIds, [unknown, later])
+    assert.equal(store.getExtractionJob(original.id).provider, undefined)
+    assert.equal(store.db.prepare('SELECT request_seq FROM extraction_source_routes WHERE source_id = ?').get(other).request_seq, null)
+    assert.deepEqual(store.captureMessage({ sessionId: 's1', role: 'user', content: 'Synthetic source first', createdAt: now,
+      sourceEventId: 'first', agentPreset: 'agent-mock' }), { id: first, created: false }, 'late binding must not break exact event replay')
+    store.freezeExtractionJob(runnable.id, now)
+    store.updateExtractionJob(runnable.id, 'uncertain_remote', 'synthetic unknown outcome', now)
+    assert.equal(store.bindCommittedSourceRoute({ ...commit, seq: 5, model: 'changed' }), 0)
+    assert.equal(store.nextActionableExtractionJob('s1', now + 86400000, true, true), undefined)
+    store.close(); store = openProjectStore(root, 'route-proof')
+    assert.equal(store.getExtractionJob(runnable.id).status, 'uncertain_remote')
+    assert.equal(store.getExtractionJob(runnable.id).model, 'first')
+    assert.equal(store.db.prepare('SELECT request_seq FROM extraction_source_routes WHERE source_id = ?').get(first).request_seq, 4)
+    assert.equal(store.bindCommittedSourceRoute({ ...commit, turn: 2, seq: 9, model: 'second' }), 1)
+    assert.deepEqual(store.nextActionableExtractionJob('s1', now).sourceIds, [later], 'the next proven turn progresses independently')
+    assert.deepEqual(store.getExtractionJob(original.id).sourceIds, [unknown], 'no evidence is invented for historical unknown sources')
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
+test('route-less backlog cannot hide fresh routed sources beyond the first capture batch', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-fairness-'))
+  const store = openProjectStore(root, 'route-fairness'), now = Date.now()
+  try {
+    for (let i = 0; i < 30; i += 1) store.recordL0({ sessionId: 's1', role: 'user', content: `Unknown historical source ${i}`, createdAt: now - 1000 + i })
+    const fresh = store.recordL0({ sessionId: 's1', role: 'user', content: 'Fresh routed source', provider: 'mock', model: 'mock', createdAt: now })
+    assert.equal(store.pendingExtractionSources('s1')[0].id, fresh)
+    for (const source of store.unextracted('s1', 100)) store.enqueueExtractionJob({ sessionId: 's1', sourceId: source.id,
+      policyRevision: 'v1', quietMs: 0, maxWaitMs: 60000, now })
+    assert.equal(store.extractionJobs().filter((job) => job.provider === undefined).length, 2, 'full route-less batches do not reject the next source')
+    assert.deepEqual(store.nextActionableExtractionJob('s1', now).sourceIds, [fresh])
+    assert.deepEqual(store.pendingExtractionSources('s1'), [], 'owned failed or unresolved sources are not re-enqueued')
+    assert.equal(store.unextracted('s1', 100).length, 31)
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }) }
 })

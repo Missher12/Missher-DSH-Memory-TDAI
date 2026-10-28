@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, readFileSync, renameSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { parseExtractionJson } from '../lib/extract.js'
 import { DashboardReadSessionManager } from '../lib/dashboard-read.js'
 import { withDashboardOverviewFusion } from '../lib/dashboard-visibility.js'
@@ -121,7 +122,7 @@ test('Demo v7 no-cwd Host capture automatically produces a sourced high-confiden
   ] }))] })
   let runtime
   try {
-    runtime = new MemoryRuntime(mock.ctx, resolveConfig({ mode: 'review', extraction: { minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
+    runtime = new MemoryRuntime(mock.ctx, resolveConfig({ mode: 'review', extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
     runtime.onSessionEvent(session, { type: 'user/message', seq: 1, time: Date.now(), data: { id: 'm1', role: 'user', content: [{ type: 'text', text: '以后处理我的前端项目时，请始终使用 pnpm 作为包管理器。' }] } })
     endTurnAfterQuietWindow(runtime, session)
     await runtime.runExtraction(session.id)
@@ -150,7 +151,7 @@ test('Demo v7 disabling then reenabling generation rejects an already in-flight 
   const mock = scriptedContext({ session, script: [gate.stream] })
   let runtime
   try {
-    runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
+    runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
     runtime.onSessionEvent(session, { type: 'user/message', seq: 1, time: Date.now(), data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'Please remember to use pnpm for all my frontend work.' }] } })
     endTurnAfterQuietWindow(runtime, session)
     const pending = runtime.runExtraction(session.id)
@@ -227,11 +228,323 @@ test('Demo v7 bounded profile enumeration rejects symlinks and reaches the fifth
     assert.deepEqual(changedDepth.candidates, [], 'a saved window cannot be rebound to another relation depth')
     assert.equal(changedDepth.stopReason, 'global-read-unavailable')
 
-    let recalled = false
-    for (let window = 0; window < 8 && !recalled; window += 1) recalled = /preference 4/.test(runtime.globalRecall('preference 4', { id: `different-${window}`, header: { agentPreset: 'agent-mock' } }) ?? '')
-    assert.equal(recalled, true, 'later real sessions can recall the fifth source')
+    const recalled = runtime.globalRecall('preference 4', { id: 'first-real-session', header: { agentPreset: 'agent-mock' } })
+    assert.match(recalled, /preference 4/, 'the first pre-step must reach the fifth source without another session or repeated question')
     assert.ok(!sources.keys.includes('source-symlink'))
   } finally { f.close(); outside.close() }
+})
+
+// Observe real windows and proof ledgers; hooks only inject the boundary under test.
+function observeRecall(runtime, hooks = {}) {
+  const read = runtime.readDashboard, open = runtime.beginDashboardAggregateRead, prove = runtime.proveGlobalRecall
+  const member = runtime.openDashboardDirectoryMember, manager = runtime.dashboardReadSessions
+  const retain = manager.retainGlobalProgress, tokenMethods = new Map()
+  const trace = { windows: 0, reads: [], emitted: new Set(), proofs: [], counters: [], codecs: [],
+    readers: [], tokens: new Set(), bookmarks: [], connections: new Map() }
+  // These fixtures start before their first dashboard read, so every retired token is observable.
+  assert.deepEqual(manager.stats(), { sessions: 0, activeCalls: 0, accountedBytes: 0, closed: false })
+  for (const name of ['begin', 'continue', 'finish']) {
+    const original = manager[name]; tokenMethods.set(name, original)
+    manager[name] = function (...args) {
+      const result = Reflect.apply(original, this, args)
+      if (result.status === 'ok') for (const key of ['callToken', 'continuationToken']) {
+        if (result.value[key] !== undefined) trace.tokens.add(result.value[key])
+      }
+      return result
+    }
+  }
+  manager.retainGlobalProgress = function (callToken, dispose, keep) {
+    const entry = { token: undefined, disposals: 0, completed: 0 }
+    const result = Reflect.apply(retain, this, [callToken, () => {
+      entry.disposals += 1
+      const output = dispose()
+      entry.completed += 1
+      return output
+    }, keep])
+    if (result.status === 'ok') { entry.token = result.value; trace.bookmarks.push(entry) }
+    return result
+  }
+  runtime.openDashboardDirectoryMember = function (...args) {
+    const result = Reflect.apply(member, this, args)
+    if (result.status === 'ok') {
+      const store = result.value.store
+      // Runtime-owned writer connections intentionally outlive a read. Track actual read-only closes.
+      if (runtime.stores.get(args[0]) !== store && !trace.connections.has(store)) {
+        const entry = { close: store.close, calls: 0, completed: 0 }
+        trace.connections.set(store, entry)
+        store.close = function (...closeArgs) {
+          entry.calls += 1
+          const output = Reflect.apply(entry.close, this, closeArgs)
+          entry.completed += 1
+          return output
+        }
+      }
+    }
+    return result
+  }
+  let proofDepth = 0
+  runtime.proveGlobalRecall = function (...args) {
+    proofDepth += 1
+    try { return Reflect.apply(prove, this, args) } finally { proofDepth -= 1 }
+  }
+  runtime.readDashboard = function (input) {
+    if (input.action === 'global') trace.windows += 1
+    const output = Reflect.apply(read, this, [input])
+    trace.reads.push(input.action)
+    trace.codecs.push(ReadDashboardResultSchema.safeParse(output).success)
+    for (const item of output.global?.items ?? []) trace.emitted.add(item.key)
+    hooks.page?.(output, input, trace)
+    return output
+  }
+  runtime.beginDashboardAggregateRead = function (...args) {
+    const proof = proofDepth > 0
+    if (proof) hooks.beforeProofOpen?.(trace)
+    const opened = Reflect.apply(open, this, args)
+    if (opened.status !== 'ok') return opened
+    const reader = opened.value, publish = reader.publishProof
+    trace.readers.push(reader)
+    if (proof) {
+      const entry = { reader, initialKeys: [...args[0].projectKeys], keys: [], resolved: [], heads: [] }
+      const select = reader.selectGlobalSource, resolve = reader.resolveRoot, head = reader.proveManagedPersonaSource
+      trace.proofs.push(entry)
+      reader.selectGlobalSource = function (key) {
+        const result = Reflect.apply(select, this, [key])
+        entry.keys = [...this.globalPublicationSources()]
+        return result
+      }
+      reader.proveManagedPersonaSource = function (key, id, revision) {
+        const result = Reflect.apply(head, this, [key, id, revision])
+        entry.heads.push({ key, id, status: result.status, state: result.value })
+        return result
+      }
+      reader.resolveRoot = function (key, id, ...rest) {
+        const result = Reflect.apply(resolve, this, [key, id, ...rest])
+        entry.resolved.push({ key, id, status: result.status, state: result.value?.state })
+        return result
+      }
+    }
+    reader.publishProof = function (...proofArgs) {
+      const result = Reflect.apply(publish, this, proofArgs)
+      if (result.status === 'ok') trace.counters.push(manager.counters(reader.callToken))
+      return result
+    }
+    return opened
+  }
+  return { trace, restore() {
+    runtime.readDashboard = read; runtime.beginDashboardAggregateRead = open; runtime.proveGlobalRecall = prove
+    runtime.openDashboardDirectoryMember = member; manager.retainGlobalProgress = retain
+    for (const [name, original] of tokenMethods) manager[name] = original
+    for (const [store, entry] of trace.connections) store.close = entry.close
+  } }
+}
+
+function assertRecallReleased(runtime, trace) {
+  assert.ok(trace.codecs.every(Boolean), 'all real RPC responses retain their strict codec')
+  assert.ok(trace.windows + trace.proofs.length <= 8, 'scan and final-proof windows share a finite total')
+  for (const proof of trace.proofs) {
+    assert.deepEqual(proof.initialKeys, [], 'proof bootstrap completes its control probe before any source is admitted')
+    assert.ok(proof.keys.length <= 4, 'actual selected sources preserve the physical binding limit')
+    for (const item of [...proof.heads, ...proof.resolved]) assert.ok(proof.keys.includes(item.key), 'body/head reads only use admitted sources')
+  }
+  for (const counters of trace.counters) {
+    assert.equal(counters.status, 'ok')
+    for (const [kind, limit] of [['call', runtime.dashboardReadSessions.limits.perCall], ['session', runtime.dashboardReadSessions.limits.perSession]]) {
+      for (const field of ['sqlStatements', 'rowsVisited', 'materializedBytes', 'keyBytes', 'projects']) {
+        assert.ok(counters.value[kind][field] <= limit[field], `${kind}/${field} remains inside its original ledger`)
+      }
+    }
+  }
+  const manager = runtime.dashboardReadSessions
+  for (const entry of trace.bookmarks) {
+    assert.equal(entry.disposals, 1, 'each real progress lease invokes its disposal exactly once')
+    assert.equal(entry.completed, 1, 'the real bookmark cleanup completed')
+    assert.equal(manager.inspectGlobalProgress(entry.token), false, 'released bookmarks cannot be replayed')
+  }
+  for (const reader of trace.readers) {
+    assert.equal(reader.ended, true)
+    assert.equal(reader.globalHandles.size, 0, 'all selected source handles were released')
+  }
+  for (const entry of trace.connections.values()) {
+    assert.equal(entry.calls, 1, 'each opened read-only connection was closed once')
+    assert.equal(entry.completed, 1, 'the actual connection close completed')
+  }
+  assert.equal(runtime.globalReader.states.size, 0)
+  assert.equal(runtime.globalReader.progress.size, 0, 'no directory progress survives outside the retired-token ledger')
+  assert.equal(runtime.dashboardReadOnlyStores.size, 0)
+  assert.equal(runtime.dashboardVisibilityReaders.size, 0)
+  // All issued call/continuation tokens are now retired. The manager keeps at most 256
+  // replay tombstones of 64 bytes each; progress leases and live work must contribute zero.
+  const expected = { sessions: 0, activeCalls: 0, accountedBytes: Math.min(trace.tokens.size, 256) * 64, closed: false }
+  assert.deepEqual(manager.stats(), expected, 'remaining accounting is exactly the observed bounded tombstones')
+  for (const token of trace.tokens) assert.notEqual(manager.inspectContinuation(token).status, 'ok', 'retired tokens cannot resume a read')
+  assert.deepEqual(manager.stats(), expected, 'replay checks do not allocate or erase accounting')
+}
+
+const recallSession = { id: 'first-pre-step', header: { agentPreset: 'agent-mock' } }
+
+test('Demo v7 one pre-step traverses unmatched windows without retaining progress for another session', (t) => {
+  const f = fixture(); let observed
+  // Count/continuation behavior is independent of CI disk speed; the first-call regression above uses the real clock.
+  t.mock.method(performance, 'now', () => 0)
+  try {
+    for (let n = 0; n < 5; n += 1) seed(f.root, `source-${n}`, n === 4 ? 'quartzneedle preferred workflow' : `unrelated archive ${n}`)
+    const runtime = f.open(); observed = observeRecall(runtime)
+    for (const header of [{ agentPreset: 'agent-mock' }, { cwd: '/synthetic/source-0', agentPreset: 'agent-mock' }]) {
+      const start = observed.trace.windows
+      assert.match(runtime.globalRecall('quartzneedle', { id: 'fresh-reader', header }), /quartzneedle/)
+      assert.ok(observed.trace.windows - start > 1, 'empty matching windows still make physical scan progress')
+      assert.equal(runtime.globalReader.progress.size, 0, 'no next-query cursor or directory lease is retained')
+      // Each independent pre-step has its own eight-window limit.
+      assertRecallReleased(runtime, { ...observed.trace, windows: observed.trace.windows - start, proofs: observed.trace.proofs.slice(-1) })
+    }
+  } finally { observed?.restore(); f.close() }
+})
+
+test('Demo v7 pre-step caps total windows and candidate work while retaining partial truth', (t) => {
+  t.mock.method(performance, 'now', () => 0)
+  for (const mode of ['many-sources', 'many-records']) {
+    const f = fixture(); let observed
+    try {
+      for (let n = 0; n < (mode === 'many-sources' ? 32 : 80); n += 1) {
+        seed(f.root, mode === 'many-sources' ? `source-${String(n).padStart(2, '0')}` : 'source-a', `pnpm preference ${n}`, { sourceEventId: `bounded-${n}` })
+      }
+      const runtime = f.open({ recall: { maxTokens: 2000, maxResults: 5 } }); observed = observeRecall(runtime)
+      const packet = runtime.globalRecall('pnpm', recallSession)
+      assert.match(packet, /全局记忆（已读取部分）/)
+      assert.ok((packet.match(/^- \[/gm) ?? []).length <= 5, 'the existing output cap is unchanged')
+      assert.ok(observed.trace.windows > 1)
+      if (mode === 'many-records') {
+        assert.ok(observed.trace.emitted.size >= 50, 'the real scan reaches candidate capacity')
+        assert.ok(observed.trace.emitted.size < 80, 'capacity stops further scans before reading the full fixture')
+      }
+      assertRecallReleased(runtime, observed.trace)
+    } finally { observed?.restore(); f.close() }
+  }
+})
+
+test('Demo v7 recall beyond 250ms still proves current bodies and rejects revoked forgotten or revised sources', () => {
+  const waiter = new Int32Array(new SharedArrayBuffer(4))
+  for (const mode of ['visible', 'revoked', 'forgotten', 'revised']) {
+    const f = fixture(); let observed
+    try {
+      const record = seed(f.root, 'source-a', 'pnpm slow recall preference')
+      const runtime = f.open(); observed = observeRecall(runtime)
+      const prove = runtime.proveGlobalRecall
+      let delayed = false
+      runtime.proveGlobalRecall = function (...args) {
+        delayed = true
+        Atomics.wait(waiter, 0, 0, 300) // Real elapsed time, after scan readers close and before fresh proofs.
+        if (mode === 'revoked') runtime.control.revokeSourceEvent('source-a', 'event-source-a', record.sourceMessageIds[0])
+        else if (mode === 'forgotten') runtime.storeByKey('source-a', false).forget(record.id)
+        else if (mode === 'revised') runtime.storeByKey('source-a', false).db.prepare('UPDATE l1_memories SET revision = revision + 1 WHERE id = ?').run(record.id)
+        return Reflect.apply(prove, this, args)
+      }
+      const started = performance.now(), packet = runtime.globalRecall('pnpm', recallSession)
+      assert.equal(delayed, true); assert.ok(performance.now() - started >= 250)
+      if (mode === 'visible') {
+        assert.match(packet, /pnpm slow recall preference/)
+        assert.ok(observed.trace.proofs.some((proof) => proof.heads.some((item) => item.state === 'visible')))
+        assert.ok(observed.trace.proofs.some((proof) => proof.resolved.some((item) => item.state === 'visible')))
+      } else assert.equal(packet, undefined, 'elapsed-time removal cannot bypass current source/head/body proof')
+      assertRecallReleased(runtime, observed.trace)
+    } finally { observed?.restore(); f.close() }
+  }
+})
+
+test('Demo v7 pre-step stops repeated nonprogress and stale scan bookmarks', (t) => {
+  t.mock.method(performance, 'now', () => 0)
+  for (const mode of ['repeated', 'duplicate-only', 'stale', 'rpc-repeated']) {
+    const f = fixture(); let observed
+    try {
+      for (let n = 0; n < 12; n += 1) seed(f.root, `source-${String(n).padStart(2, '0')}`, `pnpm cursor boundary ${n}`)
+      const runtime = f.open({ recall: { maxTokens: 2000 } }); let rpcCursor
+      observed = observeRecall(runtime, { page(output) {
+        if (mode !== 'rpc-repeated' || output.cursor === undefined) return
+        if (rpcCursor === undefined) rpcCursor = output.cursor
+        else output.cursor = rpcCursor
+      } })
+      const search = runtime.searchGlobalWindow; let calls = 0, first
+      runtime.searchGlobalWindow = function (...args) {
+        calls += 1
+        if (mode === 'repeated' && calls === 2) return first
+        const result = Reflect.apply(search, this, args)
+        if (calls === 1) {
+          first = result
+          if (mode !== 'rpc-repeated') assert.ok(result.nextScan, 'the fixture reaches a real scan bookmark')
+          if (mode === 'stale') runtime.dashboardReadSessions.dropGlobalProgress(result.nextScan)
+        } else if (mode === 'duplicate-only') return { ...result, candidates: first.candidates }
+        return result
+      }
+      const packet = runtime.globalRecall('pnpm', recallSession)
+      assert.equal(calls, mode === 'rpc-repeated' ? 1 : 2, 'one pre-step stops at the first stale or nonprogress result')
+      if (mode === 'rpc-repeated') assert.equal(observed.trace.reads.filter((action) => action === 'continue').length, 1)
+      if (mode === 'stale') assert.equal(packet, undefined)
+      else assert.match(packet, /已读取部分/)
+      assertRecallReleased(runtime, observed.trace)
+    } finally { observed?.restore(); f.close() }
+  }
+})
+
+test('Demo v7 pre-step rechecks earlier-window forget revocation revision and expiry', (t) => {
+  t.mock.method(performance, 'now', () => 0)
+  for (const mode of ['forget', 'revoke', 'revision', 'expiry']) {
+    const f = fixture(), records = new Map(); let observed, target
+    try {
+      for (let n = 0; n < 5; n += 1) records.set(`source-${n}`, seed(f.root, `source-${n}`, `pnpm earlier-window ${n}`))
+      const runtime = f.open({ recall: { maxTokens: 2000, maxResults: 5 } })
+      observed = observeRecall(runtime, { page(output, input, trace) {
+        if (target || !output.global?.next) return
+        target = parseGlobalMemoryKey([...trace.emitted][0])
+        const record = records.get(target.projectKey), writer = runtime.storeByKey(target.projectKey, false)
+        if (mode === 'forget') writer.forget(target.id)
+        else if (mode === 'revoke') runtime.control.revokeSourceEvent(target.projectKey, `event-${target.projectKey}`, record.sourceMessageIds[0])
+        else if (mode === 'revision') writer.db.prepare('UPDATE l1_memories SET revision = revision + 1 WHERE id = ?').run(target.id)
+        else writer.db.prepare('UPDATE l1_memories SET expiry_at = ? WHERE id = ?').run(Date.now() - 1, target.id)
+      } })
+      const packet = runtime.globalRecall('pnpm', recallSession)
+      assert.ok(target, 'the mutation happens after a real earlier publication window')
+      assert.ok(observed.trace.windows > 1, 'the same call continues after the mutation')
+      assert.ok(observed.trace.proofs.some((entry) => [...entry.heads, ...entry.resolved].some((item) => item.key === target.projectKey && item.id === target.id && item.status === 'ok' && item.state !== 'visible')),
+        'the old candidate reaches the fresh exact-ID proof and is rejected there')
+      assert.ok(!(packet ?? '').includes(globalMemoryKey(target.projectKey, target.id)))
+      assert.match(packet, /已读取部分/)
+      assertRecallReleased(runtime, observed.trace)
+    } finally { observed?.restore(); f.close() }
+  }
+})
+
+test('Demo v7 pre-step final proof fences earlier proof windows after later selected reads', (t) => {
+  t.mock.method(performance, 'now', () => 0)
+  for (const mode of ['revoke', 'version', 'expiry', 'file-replacement', 'symlink']) {
+    const f = fixture(); let observed, fired = false, earlierResolved = false
+    try {
+      const records = new Map()
+      for (let n = 0; n < 5; n += 1) records.set(`source-${n}`, seed(f.root, `source-${n}`, `pnpm final-window ${n}`))
+      const runtime = f.open({ recall: { maxTokens: 2000, maxResults: 5 } })
+      const expiry = Date.now() + 600_000
+      if (mode === 'expiry') for (const [key, record] of records) runtime.storeByKey(key, false).db.prepare('UPDATE l1_memories SET expiry_at = ? WHERE id = ?').run(expiry, record.id)
+      observed = observeRecall(runtime, { beforeProofOpen(trace) {
+        if (fired || trace.proofs.length !== 1) return
+        const first = trace.proofs[0], item = first.resolved.find((candidate) => candidate.state === 'visible')
+        earlierResolved = item !== undefined
+        if (!item) return
+        fired = true
+        if (mode === 'expiry') first.reader.wallNow = () => expiry + 1
+        else if (mode === 'revoke') runtime.control.revokeSourceEvent(item.key, `event-${item.key}`, records.get(item.key).sourceMessageIds[0])
+        else if (mode === 'version') runtime.storeByKey(item.key, false).db.prepare('UPDATE l1_memories SET confidence = ? WHERE id = ?').run(.73, item.id)
+        else {
+          const file = path.join(f.root, 'projects', item.key, 'memory.db'), detached = file + '.detached'
+          renameSync(file, detached)
+          if (mode === 'symlink') symlinkSync(path.basename(detached), file)
+          else writeFileSync(file, 'synthetic replacement database identity')
+        }
+      } })
+      assert.equal(runtime.globalRecall('pnpm', recallSession), undefined, 'no previously packed body survives a failed final proof')
+      assert.equal(fired, true); assert.equal(earlierResolved, true)
+      assert.equal(observed.trace.proofs.length, 2, 'five selected physical sources exercise both final proof windows')
+      assertRecallReleased(runtime, observed.trace)
+    } finally { observed?.restore(); f.close() }
+  }
 })
 
 test('Demo v7 RPC refuses requested filesystem roots and project scope controls', () => {
@@ -514,12 +827,12 @@ test('Demo v7 final publication retains the earliest dependency expiry of an ear
   for (const surface of ['rpc', 'search']) assertGlobalPublicationFence('dependency-expiry', surface)
 })
 
-test('Demo v7 automatic L3 respects disabled gates zero budgets and excluded agents', async () => {
+test('Demo v7 automatic L3 respects explicit disabled gates and excluded agents', async () => {
   for (const patch of [{ generateMemory: false }, { capture: { enabled: false } }, { extraction: { enabled: false } },
-    { budget: { automaticDailyTokens: 0 } }, { budget: { automaticDailyTasks: 0 } }, { capture: { excludeAgents: ['agent-mock'] } }]) {
+    { capture: { excludeAgents: ['agent-mock'] } }]) {
     const f = fixture(), session = { id: 'guarded', header: { agentPreset: 'agent-mock' }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock-model' } }) }
     const mock = scriptedContext({ session, script: [] })
-    const runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1, ...patch.extraction },
+    const runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1, ...patch.extraction },
       budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100, ...patch.budget }, ...Object.fromEntries(Object.entries(patch).filter(([key]) => key !== 'extraction' && key !== 'budget')) }), f.root)
     try {
       runtime.onSessionEvent(session, { type: 'user/message', seq: 1, time: Date.now(), data: { id: 'guarded', role: 'user', content: [{ type: 'text', text: '请始终使用 pnpm 管理我的项目。' }] } })
@@ -530,7 +843,7 @@ test('Demo v7 automatic L3 respects disabled gates zero budgets and excluded age
   }
 })
 
-test('Demo v7 effective switches honor legacy disables and persist deliberate enable without raising zero budgets', async () => {
+test('Demo v7 effective switches honor explicit disables and ignore legacy zero quotas after restart', async () => {
   const f = fixture(), config = { capture: { enabled: false }, extraction: { enabled: false }, recall: { enabled: false }, budget: { automaticDailyTokens: 0 } }
   try {
     let runtime = f.open(config)
@@ -538,8 +851,9 @@ test('Demo v7 effective switches honor legacy disables and persist deliberate en
     assert.equal(initial.global.generateMemory, false); assert.equal(initial.global.useMemory, false)
     runtime.updateSettings({ generateMemory: true, useMemory: true }); runtime.close(); runtime = f.open(config)
     const enabled = await read(runtime)
-    assert.equal(enabled.global.generateMemory, true); assert.equal(enabled.global.useMemory, true); assert.equal(enabled.global.paused, true)
-    assert.equal(runtime.config.budget.automaticDailyTokens, 0)
+    assert.equal(enabled.global.generateMemory, true); assert.equal(enabled.global.useMemory, true); assert.equal(enabled.global.paused, false)
+    assert.equal('budget' in runtime.config, false)
+    assert.equal('automaticBudget' in enabled.global, false)
   } finally { f.close() }
 })
 
@@ -612,7 +926,7 @@ test('Demo v7 progress bookmarks are accounted replayable expiring and invalidat
 test('Demo v7 source revisions invalidate an automatically produced persona', async () => {
   const f = fixture(), session = { id: 'revision', header: { agentPreset: 'agent-mock' }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock-model' } }) }
   const mock = scriptedContext({ session, script: [sourceAwareStream((ids) => ({ memories: [{ content: 'pnpm preference', kind: 'preference', confidence: .99, source_message_ids: ids }] }))] })
-  const runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
+  const runtime = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
   let observedDb, originalPrepare
   try {
     runtime.onSessionEvent(session, { type: 'user/message', seq: 1, time: Date.now(), data: { id: 'revision', role: 'user', content: [{ type: 'text', text: '请记住我偏好使用 pnpm 管理依赖。' }] } })
@@ -946,7 +1260,7 @@ async function automaticEightSourcePersonaFixture(peers = true) {
   const mock = scriptedContext({ session, script: [sourceAwareStream((ids) => ({ memories: preferences.map((text) => ({
     content: `用户偏好${text}。`, kind: 'preference', confidence: .99, source_message_ids: ids,
   })) }))] })
-  const generator = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1, maxMemoriesPerPass: 8 },
+  const generator = new MemoryRuntime(mock.ctx, resolveConfig({ extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1, maxMemoriesPerPass: 8 },
     budget: { automaticDailyTokens: 1000000, automaticDailyTasks: 100 } }), f.root)
   let projectKey, persona
   try {
@@ -1192,4 +1506,134 @@ test('Demo v7 persona continuation cancellation policy changes and bookmark evic
     assert.equal(evicted, true); assert.equal(result.failed?.status, 'stale')
     assert.equal(result.failed.global, undefined); assert.equal(trace.readers.length, 1)
   } finally { closeSceneFixture(f, runtime, trace) }
+})
+
+// Exercise the public filtered L1 traversal, including all empty pages and explicit windows.
+function filteredL1Fixture() {
+  const f = fixture('v7-filtered-tail-'), records = [], tails = new Set()
+  for (let project = 0; project < 6; project += 1) for (let row = 0; row < 12; row += 1) {
+    const key = `filtered-${project}`, id = `row-${String(row).padStart(2, '0')}`
+    const content = `${row === 11 ? 'quartzneedle' : 'unrelated archive'} source ${project} record ${row}`
+    const record = seed(f.root, key, content, { fixedId: id, sourceEventId: `event-${project}-${row}` })
+    records.push({ ...record, projectKey: key })
+    if (row === 11) tails.add(globalMemoryKey(key, id))
+  }
+  return { ...f, records, tails }
+}
+
+function observeFilteredL1(runtime, beforePublish) {
+  const observed = observeRecall(runtime), open = runtime.beginDashboardAggregateRead, visited = new Set()
+  let handoffs = 0, pending
+  runtime.beginDashboardAggregateRead = function (...args) {
+    const opened = Reflect.apply(open, this, args)
+    if (opened.status !== 'ok') return opened
+    const reader = opened.value, managed = reader.readManagedPage, suspend = reader.suspendForRpc, publish = reader.publishProof
+    reader.readManagedPage = function (key, ...rest) {
+      const output = Reflect.apply(managed, this, [key, ...rest])
+      if (output.status === 'ok') for (const item of output.value.items) {
+        assert.ok(reader.globalPublicationSources().includes(key), 'every filtered row retains its admitted physical source')
+        visited.add(globalMemoryKey(key, item.id))
+        if (item.record?.content.includes('quartzneedle')) pending = { key, record: item.record }
+      }
+      return output
+    }
+    reader.publishProof = function (...proofArgs) {
+      beforePublish?.(pending); pending = undefined
+      return Reflect.apply(publish, this, proofArgs)
+    }
+    reader.suspendForRpc = function (...suspendArgs) {
+      const work = reader.remainingWork(), tail = reader.finalBoundaryCost()
+      const output = Reflect.apply(suspend, this, suspendArgs)
+      if (output.status === 'ok') {
+        handoffs += 1
+        for (const field of ['sqlStatements', 'rowsVisited', 'materializedBytes', 'keyBytes']) {
+          assert.ok(work.session[field] - tail[field] >= runtime.dashboardReadSessions.limits.perCall[field],
+            `a real ${field} handoff leaves a complete next-call allowance, including resume probes`)
+        }
+      }
+      return output
+    }
+    return opened
+  }
+  return { ...observed, visited, handoffs: () => handoffs, restore() {
+    runtime.beginDashboardAggregateRead = open; observed.restore()
+  } }
+}
+
+function driveFilteredL1(runtime, query) {
+  const pages = [], windows = []
+  let resume
+  for (let window = 0; window < 16; window += 1) {
+    let page = runtime.readDashboard({ ...request('L1', query), ...(resume === undefined ? {} : { resume }) })
+    let continuations = 0
+    try {
+      for (;;) {
+        assert.equal(ReadDashboardResultSchema.safeParse(page).success, true)
+        pages.push(page)
+        if (page.global === undefined || page.cursor === undefined) break
+        assert.ok(continuations < 16, 'filtered pages retain the existing continuation bound')
+        continuations += 1
+        page = runtime.readDashboard({ version: 1, action: 'continue', readId: page.readId, cursor: page.cursor })
+      }
+    } finally {
+      if (page.readId !== undefined) assert.equal(runtime.readDashboard({ version: 1, action: 'close', readId: page.readId }).status, 'ok')
+    }
+    windows.push(page)
+    if (page.global === undefined) return { pages, windows, failed: page }
+    resume = page.global.next
+    if (resume === undefined) return { pages, windows }
+  }
+  assert.fail('filtered traversal must finish within the bounded fixture windows')
+}
+
+test('Demo v7 filtered L1 no-hit and late-hit queries traverse six sources without losing window progress', () => {
+  for (const query of ['absentneedle', 'quartzneedle']) {
+    const f = filteredL1Fixture(); let runtime, observed
+    try {
+      runtime = f.open({ generateMemory: false }); observed = observeFilteredL1(runtime)
+      const limits = runtime.dashboardReadSessions.limits
+      assert.equal(limits.perCall.sqlStatements, 64); assert.equal(limits.perSession.sqlStatements, 512)
+      assert.equal(limits.perCall.materializedBytes, 1024 * 1024); assert.equal(limits.perSession.materializedBytes, 8 * 1024 * 1024)
+      const result = driveFilteredL1(runtime, query)
+      assert.equal(result.failed, undefined, 'empty filtered pages must not conceal a failed native read')
+      assert.ok(result.windows.length > 1); assert.ok(observed.handoffs() > 0)
+      assert.ok(result.windows.some((page) => page.reason === 'global-total-budget-limit'), 'the fixture reaches a real session-work boundary')
+      assert.equal(result.windows.at(-1).global.next, undefined)
+      assert.deepEqual(observed.visited, new Set(f.records.map((record) => globalMemoryKey(record.projectKey, record.id))), 'even a no-hit query proves the entire physical keyset')
+      const items = result.pages.flatMap((page) => page.global.items), keys = items.map((item) => item.key)
+      assert.equal(new Set(keys).size, keys.length, 'cross-window results have no duplicates')
+      assert.deepEqual(new Set(keys), query === 'quartzneedle' ? f.tails : new Set())
+      assert.ok(result.pages.every((page) => page.global.generateMemory === false), 'generation OFF does not truncate browsing')
+      assert.equal(result.windows.at(-1).complete, false, 'completed traversal across windows is still a partial-count view')
+      assert.equal(result.windows.at(-1).global.counts.L1.relation, 'lower_bound')
+      for (const entry of observed.trace.counters) for (const kind of ['call', 'session']) {
+        assert.equal(entry.status, 'ok')
+        const bound = kind === 'call' ? limits.perCall : limits.perSession
+        for (const field of ['sqlStatements', 'rowsVisited', 'materializedBytes', 'keyBytes', 'projects']) assert.ok(entry.value[kind][field] <= bound[field])
+      }
+      for (const reader of observed.trace.readers) { assert.equal(reader.ended, true); assert.equal(reader.globalHandles.size, 0) }
+      for (const entry of observed.trace.connections.values()) { assert.equal(entry.calls, 1); assert.equal(entry.completed, 1) }
+      assert.equal(runtime.globalReader.states.size, 0); assert.equal(runtime.dashboardReadOnlyStores.size, 0)
+    } finally { closeSceneFixture(f, runtime, observed) }
+  }
+})
+
+test('Demo v7 filtered L1 late-hit publication rejects a changed source without returning payload or progress', () => {
+  const f = filteredL1Fixture(); let runtime, observed, fired = false
+  try {
+    runtime = f.open({ generateMemory: false })
+    observed = observeFilteredL1(runtime, (pending) => {
+      if (fired || pending === undefined) return
+      fired = true
+      const writer = openProjectStore(f.root, pending.key)
+      try { writer.db.prepare('UPDATE l1_memories SET revision = revision + 1 WHERE id = ?').run(pending.record.id) }
+      finally { writer.close() }
+    })
+    const result = driveFilteredL1(runtime, 'quartzneedle')
+    assert.equal(fired, true, 'the real late body must be reached before invalidating its publication')
+    assert.equal(result.failed?.status, 'stale')
+    assert.equal(result.failed.global, undefined); assert.equal(result.failed.cursor, undefined)
+    assert.ok(result.pages.slice(0, -1).every((page) => page.global.items.length === 0), 'no earlier filtered page publishes the pending late body')
+    for (const reader of observed.trace.readers) { assert.equal(reader.ended, true); assert.equal(reader.globalHandles.size, 0) }
+  } finally { closeSceneFixture(f, runtime, observed) }
 })

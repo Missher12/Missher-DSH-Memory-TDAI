@@ -79,22 +79,38 @@ test('plugin entry registers tools, captures L0, extracts, and injects at pre-st
       'memory_task_context',
     ])
 
-    const session = { id: 's1', header: { cwd, agentPreset: 'agent-mock' }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }) }
+    let committed
+    const session = { id: 's1', header: { cwd, agentPreset: 'agent-mock' }, requestHeader: () => committed }
+    host.sessions.get = (id) => id === session.id ? session : undefined
+    await host.emit('session/event', session, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+    await host.emit('session/event', session, { type: 'step/start', seq: 2, data: { turn: 1, step: 1 } })
     await host.emit('session/event', session, {
-      type: 'user/message',
-      seq: 1,
+      type: 'user/message', seq: 3,
       data: { role: 'user', content: [{ type: 'text', text: '以后前端都用 pnpm。' }], source: { kind: 'user' } },
     })
+    assert.equal(session.requestHeader(), undefined, 'the actual Host order admits the first user message before the header')
+    committed = { config: { provider: 'mock', model: 'mock' } }
+    await host.emit('session/event', session, { type: 'request/header', seq: 4, data: { header: committed, reason: 'initial' } })
     await host.emit('session/event', session, {
-      type: 'assistant/message',
-      seq: 2,
-      data: { message: { role: 'assistant', content: [{ type: 'text', text: '好的。' }] } },
+      type: 'assistant/message', seq: 5,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '好的。' }], source: { provider: 'mock', model: 'mock' } } },
     })
-    await host.emit('session/event', session, { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } })
+    await host.emit('session/event', session, { type: 'turn/end', seq: 6, data: { turn: 1, reason: { kind: 'completed' } } })
     await new Promise((resolve) => setTimeout(resolve, 1600))
+    const proof = openProjectStore(path.join(root, 'memory-tdai'), projectIdentity(cwd).key, projectIdentity(cwd))
+    try {
+      const user = proof.db.prepare("SELECT id, provider, model, turn FROM l0_messages WHERE role = 'user'").get()
+      assert.equal(user.provider, null); assert.equal(user.model, null); assert.equal(user.turn, null, 'capture provenance stays unchanged')
+      const binding = proof.db.prepare('SELECT * FROM extraction_source_routes WHERE source_id = ?').get(user.id)
+      assert.equal(binding.session_id, 's1'); assert.equal(binding.turn, 1); assert.equal(binding.step, 1)
+      assert.equal(binding.capture_seq, 3); assert.equal(binding.request_seq, 4); assert.equal(binding.evidence_kind, 'request/header')
+      assert.equal(proof.extractionJobs()[0].status, 'completed')
+    } finally { proof.close() }
 
+    // A distinct session's real pre-step hook reads the approved, source-backed result.
+    const receivingSession = { id: 's2', header: { cwd, agentPreset: 'agent-mock' } }
     const payload = {
-      agent: { session },
+      agent: { session: receivingSession },
       messages: [{ id: 'u1', role: 'user', content: [{ type: 'text', text: '前端用什么包管理器？' }], source: { kind: 'user' } }],
       step: 1,
       turn: 2,

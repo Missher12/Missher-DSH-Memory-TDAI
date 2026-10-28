@@ -7,7 +7,7 @@ import test from 'node:test'
 import { resolveConfig } from '../lib/config.js'
 import { MemoryRuntime } from '../lib/memory.js'
 import { projectIdentity } from '../lib/project.js'
-import { MEMORY_SCHEMA_VERSION, openProjectStore } from '../lib/store.js'
+import { MEMORY_SCHEMA_VERSION, openProjectStore, openProjectStoreReadOnly } from '../lib/store.js'
 import { estimateTokens } from '../lib/tokens.js'
 import { endTurnAfterQuietWindow, sourceAwareStream } from './helpers.mjs'
 
@@ -56,7 +56,7 @@ test('restart reloads unextracted L0 and extracts it once', async () => {
     const config = resolveConfig({
       mode: 'balanced',
       autoApproveConfidence: 0.5,
-      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0 },
+      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0, provider: 'mock', model: 'mock-model' },
       budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 },
       recall: { enabled: true, minScore: 0 },
     })
@@ -99,7 +99,7 @@ test('review mode requires approval before recall', async () => {
     // Demo v7 replaces mandatory review with confidence gating. Preserve the negative: uncertain candidates need explicit legacy approval.
     const config = resolveConfig({
       mode: 'review',
-      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0 },
+      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0, provider: 'mock', model: 'mock-model' },
       budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 },
       recall: { enabled: true, minScore: 0 },
     })
@@ -284,14 +284,14 @@ test('store upgrades and reopens at the current schema while rejecting future ve
 
     const filePath = path.join(root, 'projects', 'legacy', 'memory.db')
     const futureMetaDb = new DatabaseSync(filePath)
-    futureMetaDb.prepare("UPDATE meta SET value = '10' WHERE key = 'schema_version'").run()
-    futureMetaDb.exec('PRAGMA user_version = 9')
+    futureMetaDb.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(MEMORY_SCHEMA_VERSION + 1))
+    futureMetaDb.exec(`PRAGMA user_version = ${MEMORY_SCHEMA_VERSION}`)
     futureMetaDb.close()
     assert.throws(() => openProjectStore(root, 'legacy', project), /schema is newer than this plugin supports/u)
 
     const futureUserVersionDb = new DatabaseSync(filePath)
-    futureUserVersionDb.prepare("UPDATE meta SET value = '9' WHERE key = 'schema_version'").run()
-    futureUserVersionDb.exec('PRAGMA user_version = 10')
+    futureUserVersionDb.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(MEMORY_SCHEMA_VERSION))
+    futureUserVersionDb.exec(`PRAGMA user_version = ${MEMORY_SCHEMA_VERSION + 1}`)
     futureUserVersionDb.close()
     assert.throws(() => openProjectStore(root, 'legacy', project), /schema is newer than this plugin supports/u)
   } finally {
@@ -374,4 +374,34 @@ test('a failed pre-migration backup blocks schema 7 migration before the databas
     rmSync(root, { recursive: true, force: true })
     rmSync(cwd, { recursive: true, force: true })
   }
+})
+
+
+test('route provenance migration backs up schema 9 while retaining compatible read-only access', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-migration-'))
+  let store
+  try {
+    store = openProjectStore(root, 'route-migration')
+    const sourceId = store.recordL0({ sessionId: 'legacy', role: 'user', content: 'Synthetic original capture without route.' })
+    const file = store.file
+    store.close(); store = undefined
+    const legacy = new DatabaseSync(file)
+    legacy.exec("DROP TABLE extraction_source_routes; UPDATE meta SET value = '9' WHERE key = 'schema_version'; PRAGMA user_version = 9")
+    legacy.close()
+    store = openProjectStoreReadOnly(root, 'route-migration')
+    assert.equal(store.unextracted('legacy')[0].id, sourceId)
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 9, 'read-only access does not migrate inactive projects')
+    store.close()
+    store = openProjectStore(root, 'route-migration')
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, MEMORY_SCHEMA_VERSION)
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM extraction_source_routes').get().n, 0, 'old unknown routes are not backfilled')
+    assert.equal(store.unextracted('legacy')[0].id, sourceId)
+    const directory = path.join(path.dirname(file), 'migration-backups')
+    const backups = readdirSync(directory).filter((name) => name.endsWith('.db'))
+    assert.equal(backups.length, 1)
+    const receipt = JSON.parse(readFileSync(path.join(directory, `${backups[0]}.json`), 'utf8'))
+    assert.equal(receipt.schema.userVersion, 9); assert.equal(receipt.dataIdentity.l0Count, 1)
+    store.close(); store = openProjectStore(root, 'route-migration')
+    assert.equal(readdirSync(directory).filter((name) => name.endsWith('.db')).length, 1)
+  } finally { store?.close(); rmSync(root, { recursive: true, force: true }) }
 })

@@ -321,25 +321,20 @@ export class GlobalMemoryReader {
     }
     } finally { leaveProofGuard() }
     const finished = state.directoryDone && state.index >= state.keys.length && state.globalDone && (state.search?.queue.length ?? 0) === 0
-    const work = state.reader.remainingWork()
-    // Reserve serialization, the final proof and the small progress lease before exhausting a ledger.
-    const exhausted = !finished && (windowFull || ++state.rounds >= 15 || work === undefined ||
-      work.session.projects < state.reader.globalPublicationSources().length ||
-      // A fresh call may consume its full existing allowance; close before a session tail can undercut it.
-      work.session.sqlStatements < 64 || work.session.rowsVisited < 2048 ||
-      work.session.materializedBytes < 1024 * 1024 || work.session.keyBytes < 64 * 1024)
-    // Bookmarks carry positions/restart identities, never trusted scene or persona proofs.
-    // If a whole fresh window still cannot finish that item, fail without payload or another retry.
-    if (exhausted && (state.scene?.restarted || state.persona?.restarted)) throw new Error('budget-exhausted')
     const complete = finished && !state.incomplete
     const relation = complete ? 'exact' as const : 'lower_bound' as const
     const counts = Object.fromEntries(layers.map((layer) => [layer, state.request.layer === 'home' || state.request.layer === layer
       ? { value: state.counts[layer], relation } : { value: null, relation: 'unknown' }])) as GlobalMemoryPage['counts']
+    const config = this.options.config
+    const pauseReasons: NonNullable<GlobalMemoryPage['pauseReasons']> = []
+    if (!config.generateMemory) pauseReasons.push('generation_disabled')
+    if (!config.capture.enabled) pauseReasons.push('capture_disabled')
+    if (!config.extraction.enabled) pauseReasons.push('extraction_disabled')
     const global: GlobalMemoryPage = { layer: state.request.layer, query: state.request.query, items: state.request.layer === 'home' ? state.recent : items, counts,
       days: [...state.days.values()].sort((a, b) => a.date.localeCompare(b.date)), activityComplete: complete && state.request.layer === 'home',
       recentAdded: state.request.layer === 'home' ? { value: state.recentAdded, relation: complete ? 'exact' : 'lower_bound' } : { value: null, relation: 'unknown' },
       year: state.request.year, timeZone: state.request.timeZone, generateMemory: this.options.config.generateMemory && this.options.config.capture.enabled && this.options.config.extraction.enabled,
-      useMemory: this.options.config.useMemory && this.options.config.recall.enabled, paused: this.options.config.budget.automaticDailyTokens === 0 || this.options.config.budget.automaticDailyTasks === 0 }
+      useMemory: config.useMemory && config.recall.enabled, paused: pauseReasons.length > 0, pauseReasons }
     const bytes = jsonBytes(global)
     if (bytes > WIRE_BYTES - 64) throw new Error('budget-exhausted')
     if (state.globalFile !== undefined) {
@@ -354,6 +349,16 @@ export class GlobalMemoryReader {
     }
     unwrap(state.reader.publishProof())
     release()
+    const work = state.reader.remainingWork(), handoff = state.reader.finalBoundaryCost()
+    // Measure AFTER publication, and reserve the still-unpaid suspend proof. The next
+    // call's full allowance includes its resume probes; serialization was charged above.
+    const exhausted = !finished && (windowFull || ++state.rounds >= 15 || work === undefined ||
+      work.session.projects < state.reader.globalPublicationSources().length ||
+      work.session.sqlStatements - handoff.sqlStatements < 64 || work.session.rowsVisited - handoff.rowsVisited < 2048 ||
+      work.session.materializedBytes - handoff.materializedBytes < 1024 * 1024 || work.session.keyBytes - handoff.keyBytes < 64 * 1024)
+    // Bookmarks carry positions/restart identities, never trusted scene or persona proofs.
+    // If a whole fresh window still cannot finish that item, fail without payload or another retry.
+    if (exhausted && (state.scene?.restarted || state.persona?.restarted)) throw new Error('budget-exhausted')
     if (finished || exhausted) {
       let next: string | undefined
       if (exhausted && (!state.directoryDone || state.index < state.keys.length)) {

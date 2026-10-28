@@ -362,31 +362,37 @@ test('recovery blocks a paid source replay after retention removed L0 and the cu
   }
 })
 
-test('recovery apply keeps current restrictive extraction, budget, and global persona settings', async () => {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-r41-recovery-policy-'))
-  let runtime
-  try {
-    runtime = new MemoryRuntime({ logger: { info() {}, warn() {}, debug() {}, error() {} }, get() { return undefined } }, resolveConfig({}), root)
-    runtime.updateSettings({ extractionEnabled: true, automaticDailyTokens: 1200, automaticDailyTasks: 4,
-      manualDailyTokens: 900, manualDailyTasks: 3, globalPersona: true, includePersona: true })
-    const snapshot = await runtime.createRecoverySnapshot()
-    runtime.updateSettings({ extractionEnabled: false, automaticDailyTokens: 0, automaticDailyTasks: 0,
-      manualDailyTokens: 0, manualDailyTasks: 0, globalPersona: false, includePersona: false })
-
-    const plan = await runtime.recoveryPlan(snapshot.manifest.snapshotId)
-    assert.equal(plan.restoreApplyReady, true)
-    await runtime.applyRecoverySnapshot(snapshot.manifest.snapshotId)
-    const applied = runtime.dashboard()
-    assert.equal(applied.settings.extractionEnabled, false)
-    assert.equal(applied.settings.automaticDailyTokens, 0)
-    assert.equal(applied.settings.automaticDailyTasks, 0)
-    assert.equal(applied.settings.manualDailyTokens, 0)
-    assert.equal(applied.settings.manualDailyTasks, 0)
-    assert.equal(applied.settings.globalPersona, false)
-    assert.equal(applied.settings.includePersona, false)
-  } finally {
-    runtime?.close()
-    rmSync(root, { recursive: true, force: true })
+test('recovery discards legacy quotas while retaining explicit OFF and restrictive persona settings', async () => {
+  for (const limit of [0, 1]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-r41-recovery-policy-'))
+    let runtime
+    try {
+      const legacy = { automaticDailyTokens: limit, automaticDailyTasks: limit, manualDailyTokens: limit, manualDailyTasks: limit }
+      writeFileSync(path.join(root, 'settings.json'), JSON.stringify({ ...legacy, generateMemory: true, useMemory: true,
+        captureEnabled: true, recallEnabled: true, extractionEnabled: true }))
+      runtime = new MemoryRuntime({ logger: { info() {}, warn() {}, debug() {}, error() {} }, get() { return undefined } }, resolveConfig({ budget: legacy }), root)
+      const snapshot = await runtime.createRecoverySnapshot()
+      runtime.config.capture.enabled = false
+      runtime.config.recall.enabled = false
+      runtime.updateSettings({ generateMemory: false, useMemory: false, extractionEnabled: false, globalPersona: false, includePersona: false })
+      const plan = await runtime.recoveryPlan(snapshot.manifest.snapshotId)
+      assert.equal(plan.restoreApplyReady, true)
+      await runtime.applyRecoverySnapshot(snapshot.manifest.snapshotId)
+      assert.equal(runtime.config.generateMemory, false); assert.equal(runtime.config.useMemory, false)
+      assert.equal(runtime.config.capture.enabled, false); assert.equal(runtime.config.recall.enabled, false)
+      assert.equal(runtime.config.extraction.enabled, false)
+      const applied = runtime.dashboard(), settings = JSON.parse(readFileSync(path.join(runtime.stateRoot, 'settings.json'), 'utf8'))
+      for (const key of Object.keys(legacy)) { assert.equal(key in applied.settings, false); assert.equal(key in settings, false) }
+      assert.equal('budget' in runtime.config, false)
+      assert.equal(applied.settings.globalPersona, false); assert.equal(applied.settings.includePersona, false)
+      for (const budgetClass of ['automatic', 'manual']) for (let n = 0; n < 2; n += 1) {
+        const id = `restored-${budgetClass}-${n}`
+        runtime.control.reserveBillableCall({ id, projectKey: 'synthetic', purpose: 'recovery-test', budgetClass,
+          reservedTokens: 100, dailyTokenLimit: limit, dailyTaskLimit: limit })
+        runtime.control.markBillableCallDispatched(id)
+        assert.equal(runtime.control.settleBillableCall(id, 'complete', { inputTokens: 48, outputTokens: 24 }).actualTokens, 72)
+      }
+    } finally { runtime?.close(); rmSync(root, { recursive: true, force: true }) }
   }
 })
 

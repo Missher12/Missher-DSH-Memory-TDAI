@@ -12,15 +12,16 @@ import { GlobalMemoryReader, globalMemoryKey, parseGlobalMemoryKey, profileSourc
 import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, chmodSync, closeSync, copyFileSync, createReadStream, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { matchesAgentGlob, type ResolvedConfig } from './config.js'
 import type { HostContextLike, MessageLike, SessionEventLike, SessionLike } from './dsh.js'
-import { textOfMessage } from './dsh.js'
+import { asRecord, textOfMessage } from './dsh.js'
 import { extractionRequestIdentityHash, formatConversation, ObservedStreamError, parseExtractionJson, requestIdentityHash, requestExtractionDetailed, requestTextDetailed, routeFromHost, type ConversationEntry, type ObservedUsage } from './extract.js'
 import { buildPersonaUserPrompt, PERSONA_SYSTEM_PROMPT } from './prompts.js'
 import { isValidProjectKey, projectDbPath, projectIdentity, type ProjectIdentity } from './project.js'
 import { ControlLedger, type ContentDeletionIntent, type CoverageWindow } from './control.js'
 import { classifyInput, classifyQuery, coverageForDay, dateRange, mergeRouteCandidates, normalizeExactQuestion, packEvidence, rankTextCandidates } from './r41.js'
-import { evaluationRunCountForSourceRefsFile, MEMORY_SCHEMA_VERSION, openProjectStore, tokenize, type ActivityDay, type CaptureIdentityFenceCandidate, type DashboardStats, type EvaluationCase, type EvaluationRun, type EventDayMetrics, type EventOverviewMetrics, type ExperienceRecord, type ExtractionJob, type ExtractionJobSummary, type MemoryRecord, type MemoryRevision, type MemoryStore, type OriginalMessageIdentity, type PersonaRecord, type RelationCandidate, type RelationRecord, type RetrievalStrategy, type RevisionCandidate, type SceneRecord, type SearchHit, type TaskContextRecord } from './store.js'
+import { evaluationRunCountForSourceRefsFile, MEMORY_SCHEMA_VERSION, openProjectStore, initializeTokenizer, tokenize, type ActivityDay, type CaptureIdentityFenceCandidate, type DashboardStats, type EvaluationCase, type EvaluationRun, type EventDayMetrics, type EventOverviewMetrics, type ExperienceRecord, type ExtractionJob, type ExtractionJobSummary, type MemoryRecord, type MemoryRevision, type MemoryStore, type OriginalMessageIdentity, type PersonaRecord, type RelationCandidate, type RelationRecord, type RetrievalStrategy, type RevisionCandidate, type SceneRecord, type SearchHit, type TaskContextRecord } from './store.js'
 import { estimateTokens } from './tokens.js'
 import { extractionJobSourceIds, inspectMemoryDatabaseIdentity, inspectSqliteSchema, reconcileRecoverySourceConsumption, snapshotSqliteFile, type MemoryDatabaseIdentity, type SqliteSchemaInspection } from './sqlite-inspection.js'
 import { BillableResultStore, type BillableResultOperation, type BillableUsageReceipt, type SavedBillableResult } from './billable-results.js'
@@ -120,6 +121,11 @@ function durableReplace(file: string, content: string): void {
   catch { /* atomic rename remains the commit boundary on filesystems without directory fsync */ }
 }
 
+function compareGlobalRecallCandidates(a: RoutedSearchHit, b: RoutedSearchHit): number {
+  return Number(b.routes?.includes('profile_lexical') === true) - Number(a.routes?.includes('profile_lexical') === true) ||
+    b.score - a.score || b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)
+}
+
 function buildRecallContext(input: {
   projectName: string
   hits: RecallHit[]
@@ -172,6 +178,9 @@ interface SessionBuffer {
   lastExtractAt: number
   timer?: ReturnType<typeof setTimeout>
   extracting: boolean
+  hostSequence?: number
+  hostTurn?: number
+  hostStep?: number
 }
 
 export interface RuntimeStatus {
@@ -233,10 +242,6 @@ export interface DashboardSnapshot {
     extractionEveryN: number
     autoApproveConfidence: number
     extractionEnabled: boolean
-    automaticDailyTokens: number
-    automaticDailyTasks: number
-    manualDailyTokens: number
-    manualDailyTasks: number
   }
   lastError?: string
 }
@@ -378,6 +383,36 @@ export interface MemoryExplanation {
   gaps: string[]
 }
 
+// Fixed vocabulary only: diagnostics never retain queries, bodies, IDs, paths, or errors.
+type GlobalRecallStage = 'admission' | 'scan-tokenize' | 'scan-read' | 'packing' | 'proof-admission'
+  | 'proof-bootstrap' | 'proof-source' | 'proof-identity' | 'proof-head' | 'proof-body'
+  | 'proof-continuation' | 'proof-publication' | 'complete'
+type GlobalRecallReason = 'pending' | 'injected' | 'memory-use-disabled' | 'runtime-unavailable'
+  | 'read-unavailable' | 'no-candidates' | 'no-selection'
+  | 'scope-unavailable' | 'reference-invalid' | 'identity-unavailable' | 'no-visible-candidates'
+  | 'call-limit' | 'unexpected-error' | 'stale' | 'expired' | 'evicted' | 'budget-exhausted' | 'unavailable-probe'
+interface GlobalRecallDiagnostic {
+  stage: GlobalRecallStage
+  reason: GlobalRecallReason
+  scanWindows: number
+  candidateCount: number
+  selectedCount: number
+  elapsedMs: number | null
+}
+type GlobalRecallObserver = (stage: GlobalRecallStage, reason?: GlobalRecallReason) => void
+function observeGlobalRecallRead<T extends { status: string }>(observe: GlobalRecallObserver | undefined,
+  stage: GlobalRecallStage, read: () => T): T {
+  observe?.(stage)
+  const result = read()
+  switch (result.status) {
+    case 'ok': case 'partial': break
+    case 'stale': case 'expired': case 'evicted': case 'budget-exhausted': case 'unavailable-probe':
+      observe?.(stage, result.status); break
+    default: observe?.(stage, 'read-unavailable')
+  }
+  return result
+}
+
 export class MemoryRuntime {
   readonly root: string
   private currentStateRoot: string
@@ -387,7 +422,6 @@ export class MemoryRuntime {
   private readonly dashboardReadSessions = new DashboardReadSessionManager()
   private readonly dashboardVisibilityReaders = new Set<DashboardVisibilityReadSession>()
   private readonly dashboardReadOnlyStores = new Map<string, { store: MemoryStore; references: number }>()
-  private readonly globalRecallProgress = new Map<string, string>()
   private readonly globalReader!: GlobalMemoryReader
   private readonly dashboardAggregate!: DashboardAggregateService
   private readonly stores = new Map<string, MemoryStore>()
@@ -439,8 +473,6 @@ export class MemoryRuntime {
           generateMemory: this.config.generateMemory, useMemory: this.config.useMemory,
           mode: this.config.mode, recallMaxTokens: this.config.recall.maxTokens,
           extractionEveryN: this.config.extraction.everyNConversations, extractionEnabled: this.config.extraction.enabled,
-          automaticDailyTokens: this.config.budget.automaticDailyTokens, automaticDailyTasks: this.config.budget.automaticDailyTasks,
-          manualDailyTokens: this.config.budget.manualDailyTokens, manualDailyTasks: this.config.budget.manualDailyTasks,
           includePersona: this.config.recall.includePersona, globalPersona: this.config.persona.global,
         }),
         activeProjectKey: () => this.activeProjectKey,
@@ -457,6 +489,9 @@ export class MemoryRuntime {
     }
     try {
       this.loadPersistedSettings()
+      // apply() registers handlers only after this constructor returns. Prepare even when
+      // useMemory starts OFF, so later ON and the first read never initialize a dictionary.
+      initializeTokenizer()
       this.coverageWindowId = this.config.capture.enabled ? this.control.startCoverage(this.policyRevision()) : undefined
       this.startRetentionPruning()
       this.scheduleStartupRecovery()
@@ -969,12 +1004,6 @@ export class MemoryRuntime {
       if (typeof raw.extractionEveryN === 'number' && Number.isFinite(raw.extractionEveryN)) {
         this.config.extraction.everyNConversations = Math.max(1, Math.min(100, Math.floor(raw.extractionEveryN)))
       }
-      for (const [key, target] of [
-        ['automaticDailyTokens', 'automaticDailyTokens'], ['automaticDailyTasks', 'automaticDailyTasks'],
-        ['manualDailyTokens', 'manualDailyTokens'], ['manualDailyTasks', 'manualDailyTasks'],
-      ] as const) {
-        if (typeof raw[target] === 'number' && Number.isFinite(raw[target])) this.config.budget[key] = Math.max(0, Math.min(key.endsWith('Tokens') ? 10_000_000 : 100_000, Math.floor(raw[target] as number)))
-      }
       if (typeof raw.extractionEnabled === 'boolean') this.config.extraction.enabled = raw.extractionEnabled
     } catch (error) {
       this.lastError = `settings load failed: ${messageOf(error)}`
@@ -982,9 +1011,16 @@ export class MemoryRuntime {
   }
 
   onSessionEvent(session: SessionLike, event: SessionEventLike): void {
-    if (this.closed || !this.config.generateMemory || !this.config.capture.enabled) return
-    if (this.isAgentExcluded(session)) return
-    if (this.maintenance) { this.spoolCaptureEvent(session, event); return }
+    if (this.closed || !this.config.generateMemory || !this.config.capture.enabled || this.isAgentExcluded(session)) {
+      const previous = this.sessions.get(session.id)
+      if (previous) { previous.hostTurn = undefined; previous.hostStep = undefined }
+      return
+    }
+    if (this.maintenance) {
+      const previous = this.sessions.get(session.id)
+      if (previous) { previous.hostTurn = undefined; previous.hostStep = undefined }
+      this.spoolCaptureEvent(session, event); return
+    }
     const cwd = sessionCwd(session, this.stateRoot)
     if (cwd === undefined) return
     const project = projectIdentity(cwd)
@@ -996,7 +1032,44 @@ export class MemoryRuntime {
       this.refreshBuffer(session.id, buffer)
     }
     try {
+      // Header snapshots alone may belong to an older turn. Only ordered committed events establish ownership.
+      const ordered = !this.replayingCaptureSpool && Number.isSafeInteger(event.seq) && event.seq! >= 0 &&
+        (buffer.hostSequence === undefined || event.seq! > buffer.hostSequence)
+      if (!ordered || buffer.hostSequence !== undefined && event.seq !== buffer.hostSequence + 1) {
+        buffer.hostTurn = undefined; buffer.hostStep = undefined
+      }
+      if (ordered) buffer.hostSequence = event.seq
+      const rememberContext = (sourceId: string, created: boolean): void => {
+        if (created && ordered && buffer.hostTurn !== undefined && buffer.hostStep !== undefined) {
+          store.recordSourceRequestContext({ sourceId, sessionId: session.id, turn: buffer.hostTurn, step: buffer.hostStep, seq: event.seq! })
+        }
+      }
+      const commitRoute = (kind: 'request/header' | 'assistant/message', route: { provider: string; model: string } | undefined): void => {
+        if (!ordered || !route || buffer.hostTurn === undefined || buffer.hostStep === undefined) return
+        // A step can contain many messages, but capture itself is bounded. Drain bounded batches of its proven prefix.
+        for (let batch = 0; batch < 16; batch += 1) {
+          if (store.bindCommittedSourceRoute({ sessionId: session.id, turn: buffer.hostTurn, step: buffer.hostStep,
+            seq: event.seq!, kind, ...route }) < MAX_BATCH) break
+        }
+        this.schedule(session.id)
+      }
       switch (event.type) {
+        case 'turn/start':
+          buffer.hostTurn = ordered ? turnOf(event) : undefined
+          buffer.hostStep = undefined
+          return
+        case 'step/start':
+          buffer.hostStep = ordered && turnOf(event) === buffer.hostTurn ? stepOf(event) : undefined
+          return
+        case 'step/end':
+          buffer.hostStep = undefined
+          return
+        case 'request/header': {
+          const header = asRecord(event.data?.header), config = asRecord(header.config)
+          const route = routeFromHost(this.ctx, session, this.config, { provider: config.provider, model: config.model })
+          commitRoute('request/header', route)
+          return
+        }
         case 'user/message': {
           const message = event.data as MessageLike | undefined
           if (message === undefined || message.role !== 'user') return
@@ -1006,7 +1079,7 @@ export class MemoryRuntime {
           const sourceEventId = stableSourceEventId(session, event, message, 'user')
           const originalMessageIdentity = originalMessageIdentityFor(project.key, session, event, message, 'user')
           if (sourceEventId !== undefined && this.sourceEventFenced(project.key, sourceEventId)) return
-          const route = routeFromHost(this.ctx, session, this.config)
+          const route = routeFromHost(this.ctx, undefined, this.config)
           const classification = classifyInput({ role: 'user', text, sourceKind: message.source?.kind })
           const captured = store.captureMessage({ sessionId: session.id, role: 'user', content: text, turn: turnOf(event), step: stepOf(event),
             createdAt: event.time ?? Date.now(), sourceEventId, origin: 'dsh-session', sourceKind: message.source?.kind ?? 'conversation',
@@ -1014,6 +1087,7 @@ export class MemoryRuntime {
             skipExtractionReason: classification.kind === 'small_talk' ? classification.reason : undefined,
             agentPreset: session.header?.agentPreset, provider: route?.provider, model: route?.model,
           })
+          rememberContext(captured.id, captured.created)
           if (captured.created && classification.process) {
             buffer.entries.push({ id: captured.id, l0Id: captured.id, role: 'user', content: text, createdAt: event.time ?? Date.now() })
           }
@@ -1030,21 +1104,27 @@ export class MemoryRuntime {
           const sourceEventId = stableSourceEventId(session, event, message!, 'assistant')
           const originalMessageIdentity = message === undefined ? undefined : originalMessageIdentityFor(project.key, session, event, message, 'assistant')
           if (sourceEventId !== undefined && this.sourceEventFenced(project.key, sourceEventId)) return
-          const route = routeFromHost(this.ctx, session, this.config)
+          const route = routeFromHost(this.ctx, undefined, this.config)
           const classification = classifyInput({ role: 'assistant', text, sourceKind: message?.source?.kind })
           const captured = store.captureMessage({ sessionId: session.id, role: 'assistant', content: text, turn: turnOf(event), step: stepOf(event),
             createdAt: event.time ?? Date.now(), sourceEventId, origin: 'dsh-session', sourceKind: message?.source?.kind ?? 'conversation',
             originalMessageIdentity,
             agentPreset: session.header?.agentPreset, provider: route?.provider, model: route?.model,
           })
+          rememberContext(captured.id, captured.created)
           if (captured.created && classification.process) {
             buffer.entries.push({ id: captured.id, l0Id: captured.id, role: 'assistant', content: text, createdAt: event.time ?? Date.now() })
+          }
+          if (turnOf(event) === buffer.hostTurn && stepOf(event) === buffer.hostStep) {
+            const source = asRecord(message?.source)
+            commitRoute('assistant/message', routeFromHost(this.ctx, session, this.config, { provider: source.provider, model: source.model }))
           }
           this.trimBuffer(buffer)
           this.schedule(session.id)
           return
         }
         case 'turn/end':
+          buffer.hostTurn = undefined; buffer.hostStep = undefined
           this.onTurnEnd(session, buffer)
           return
         case 'session/disposed':
@@ -1073,7 +1153,7 @@ export class MemoryRuntime {
   private queuePendingSources(sessionId: string, buffer: SessionBuffer, quietMs: number): void {
     const store = this.store(buffer.project)
     const revision = this.policyRevision()
-    const pending = store.unextracted(sessionId, MAX_BATCH).filter((row) => !this.control.isContentDeleted(buffer.project.key, 'source', row.id) &&
+    const pending = store.pendingExtractionSources(sessionId, MAX_BATCH).filter((row) => !this.control.isContentDeleted(buffer.project.key, 'source', row.id) &&
       !this.control.isSourceIdRevoked(buffer.project.key, row.id) &&
       !(row.sourceEventId !== undefined && this.sourceEventFenced(buffer.project.key, row.sourceEventId)))
     if (pending.length === 0) return
@@ -1260,7 +1340,7 @@ export class MemoryRuntime {
       attemptId = `att_${randomUUID().replace(/-/g, '').slice(0, 24)}`
       const requestHash = extractionRequestIdentityHash(route, conversation, this.config.extraction.maxMemoriesPerPass, existing, this.config.extraction.maxTokens)
       const sourceDigest = createHash('sha256').update(job.sourceIds.join('\0')).digest('hex')
-      billableCallId = this.reserveProviderBudget(project.key, 'extraction', 'automatic', reservedTokens, {
+      billableCallId = this.reserveProviderCall(project.key, 'extraction', 'automatic', reservedTokens, {
         jobId: job.id, attemptId, provider: route.provider, model: route.model, requestHash,
       })
       this.control.beginAttempt({ id: attemptId, projectKey: project.key, jobId: job.id, provider: route.provider, model: route.model,
@@ -1447,8 +1527,7 @@ export class MemoryRuntime {
   /** Deterministic, source-backed L3; this path never dispatches a model or a manual billable job. */
   private refreshAutomaticPersona(projectKey: string, store: MemoryStore, batch: MemoryRecord[]): void {
     if (this.closed || this.maintenance || !this.control.isCurrentWriter() || !this.config.generateMemory ||
-        !this.config.capture.enabled || !this.config.extraction.enabled ||
-        this.config.budget.automaticDailyTokens === 0 || this.config.budget.automaticDailyTasks === 0) return
+        !this.config.capture.enabled || !this.config.extraction.enabled) return
     const policy = this.policyRevision()
     // Prefer this committed batch. Merge only a bounded previous source snapshot, never its generated prose.
     let oldIds: string[] = []
@@ -1476,16 +1555,26 @@ export class MemoryRuntime {
   memoryUseAllowed(session: SessionLike | undefined): boolean { return session != null && this.config.useMemory && this.config.recall.enabled && !this.isAgentExcluded(session) }
 
   searchGlobalDetailed(query: string, limit = 50, scanCursor?: string, relationDepth = 1): ReturnType<MemoryRuntime['searchCandidatesDetailed']> & { nextScan?: string } {
+    return this.searchGlobalWindow(query, limit, scanCursor, relationDepth)
+  }
+
+  private searchGlobalWindow(query: string, limit: number, scanCursor?: string, relationDepth = 1,
+    canContinue: () => boolean = () => true, observe?: GlobalRecallObserver): ReturnType<MemoryRuntime['searchCandidatesDetailed']> & { nextScan?: string } {
     const scanLimit = Math.max(1, Math.min(50, Math.floor(limit)))
     const empty = { candidates: [] as RoutedSearchHit[], scanLimit, policyMaxCandidates: 50, candidateCount: 0,
       scanCapped: false, routes: [] as Array<{ name: string; candidateCount: number }>, candidateGaps: [] as string[], stopReason: 'complete', temporal: false }
     if (!this.config.useMemory || !this.config.recall.enabled || this.closed || this.maintenance) return { ...empty, stopReason: 'memory-use-disabled' }
     if (!Number.isInteger(relationDepth) || relationDepth < 0 || relationDepth > 2) return { ...empty, stopReason: 'global-depth-invalid' }
-    let page = this.readDashboard({ version: 1, action: 'global', layer: 'L1', query: query.slice(0, 200), relationDepth, ...(scanCursor === undefined ? {} : { resume: scanCursor }), year: new Date().getUTCFullYear(), timeZone: 'UTC' })
+    if (!canContinue()) return { ...empty, scanCapped: true, stopReason: 'memory-use-disabled' }
+    const readIds = new Set<string>(), cursors = new Set<string>()
+    let stopped: string | undefined
+    observe?.('scan-tokenize')
     const candidates: RoutedSearchHit[] = [], terms = tokenize(query).slice(0, 32)
     try {
+      let page: ReadDashboardResult = observeGlobalRecallRead<ReadDashboardResult>(observe, 'scan-read', (): ReadDashboardResult => this.readDashboard({ version: 1, action: 'global', layer: 'L1', query: query.slice(0, 200), relationDepth, ...(scanCursor === undefined ? {} : { resume: scanCursor }), year: new Date().getUTCFullYear(), timeZone: 'UTC' }))
       for (let round = 0; round < 17; round += 1) {
-        if ((page.status !== 'ok' && page.status !== 'partial') || page.global === undefined) return { ...empty, scanCapped: true, stopReason: 'global-read-unavailable' }
+        if (page.readId !== undefined) readIds.add(page.readId)
+        if ((page.status !== 'ok' && page.status !== 'partial') || page.global === undefined || readIds.size > 1) return { ...empty, scanCapped: true, stopReason: 'global-read-unavailable' }
         for (const item of page.global.items) {
           const memory = item.memory
           if (memory === undefined) continue
@@ -1498,40 +1587,232 @@ export class MemoryRuntime {
           if (prior === undefined) candidates.push({ ...memory, id: item.key, score, routes: [...routes] })
           else { prior.score = Math.max(prior.score, score); prior.routes = [...new Set([...(prior.routes ?? []), ...routes])] }
           // Literal hits keep their reserved place; relation-only hits fill the same bounded window.
-          candidates.sort((a, b) => Number(b.routes?.includes('profile_lexical') === true) - Number(a.routes?.includes('profile_lexical') === true) ||
-            b.score - a.score || b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
+          candidates.sort(compareGlobalRecallCandidates)
           if (candidates.length > scanLimit) candidates.length = scanLimit
         }
-        if (page.cursor === undefined || page.readId === undefined) break
-        page = this.readDashboard({ version: 1, action: 'continue', readId: page.readId, cursor: page.cursor })
+        if (page.cursor === undefined) break
+        if (page.readId === undefined || cursors.has(page.cursor)) { stopped = 'global-no-progress'; break }
+        if (round === 16 || !canContinue()) { stopped = 'global-call-or-state-limit'; break }
+        cursors.add(page.cursor)
+        const continuation: ReadDashboardRequest = { version: 1, action: 'continue', readId: page.readId, cursor: page.cursor }
+        page = observeGlobalRecallRead<ReadDashboardResult>(observe, 'scan-read', (): ReadDashboardResult => this.readDashboard(continuation))
       }
-      return { ...empty, candidates, candidateCount: candidates.length, scanCapped: !page.complete,
-        ...(page.global?.next === undefined ? {} : { nextScan: page.global.next }),
+      const complete = page.complete && stopped === undefined && page.cursor === undefined
+      return { ...empty, candidates, candidateCount: candidates.length, scanCapped: !complete,
+        ...(stopped !== undefined || page.cursor !== undefined || page.global?.next === undefined ? {} : { nextScan: page.global.next }),
         routes: ['profile_lexical', 'relation'].map((name) => ({ name, candidateCount: candidates.filter((item) => item.routes?.includes(name)).length })),
-        candidateGaps: page.complete ? [] : ['global-readable-set-partial'], stopReason: page.complete ? 'complete' : 'global-budget-limit' }
+        candidateGaps: complete ? [] : ['global-readable-set-partial'], stopReason: stopped ?? (complete ? 'complete' : 'global-budget-limit') }
     } finally {
-      if (page.readId !== undefined && this.globalReader.owns(page.readId)) this.readDashboard({ version: 1, action: 'close', readId: page.readId })
+      for (const readId of readIds) if (this.globalReader.owns(readId)) this.readDashboard({ version: 1, action: 'close', readId })
     }
   }
 
+  private logGlobalRecallDiagnostic(diagnostic: GlobalRecallDiagnostic, started?: number): void {
+    try {
+      if (started !== undefined) {
+        const elapsed = performance.now() - started
+        diagnostic.elapsedMs = Number.isFinite(elapsed) && elapsed >= 0 ? Math.round(elapsed * 100) / 100 : null
+      }
+      this.ctx.logger?.debug?.(`[memory-tdai] global-recall ${JSON.stringify(diagnostic)}`)
+    } catch { /* diagnostics must never change recall or cleanup behavior */ }
+  }
+
   globalRecall(userText: string, session: SessionLike): string | undefined {
-    if (!this.config.useMemory || !this.config.recall.enabled || this.isAgentExcluded(session)) return undefined
-    const query = userText.slice(0, 200)
-    const collection = this.searchGlobalDetailed(query, 50, this.globalRecallProgress.get(query))
-    this.globalRecallProgress.delete(query)
-    if (collection.nextScan !== undefined) this.globalRecallProgress.set(query, collection.nextScan)
-    while (this.globalRecallProgress.size > 2) this.globalRecallProgress.delete(this.globalRecallProgress.keys().next().value!)
-    const seen = new Set<string>()
-    const hits: RecallHit[] = collection.candidates.flatMap((record) => {
-      const normalized = record.content.trim().toLocaleLowerCase()
-      if (seen.has(normalized)) return []
-      seen.add(normalized)
-      return [{ record, score: record.score }]
-    })
-    // Global reads already perform the final current-scope/version/TTL proof before returning any packet.
-    if (!this.config.useMemory || this.isAgentExcluded(session)) return undefined
-    return buildRecallContext({ projectName: collection.scanCapped ? '全局记忆（已读取部分）' : '全局记忆', hits, maxTokens: this.config.recall.maxTokens,
-      maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults }).text
+    const diagnostic: GlobalRecallDiagnostic = { stage: 'admission', reason: 'pending', scanWindows: 0,
+      candidateCount: 0, selectedCount: 0, elapsedMs: 0 }
+    if (!this.memoryUseAllowed(session) || this.closed || this.maintenance) {
+      diagnostic.reason = this.closed || this.maintenance ? 'runtime-unavailable' : 'memory-use-disabled'
+      this.logGlobalRecallDiagnostic(diagnostic)
+      return undefined
+    }
+    const query = userText.slice(0, 200), started = performance.now()
+    const observe: GlobalRecallObserver = (stage, reason = 'pending') => { diagnostic.stage = stage; diagnostic.reason = reason }
+    const canContinue = (): boolean => this.memoryUseAllowed(session) && !this.closed && !this.maintenance
+    const bookmarks = new Set<string>(), candidates = new Map<string, RoutedSearchHit>()
+    let cursor: string | undefined, partial = false
+    try {
+      // Reserve two of the eight windows for final proofs (the manager holds at most two live sessions).
+      for (let window = 0; window < 6; window += 1) {
+        if (!canContinue()) { partial = true; break }
+        diagnostic.scanWindows += 1
+        const collection = this.searchGlobalWindow(query, 50, cursor, 1, canContinue, observe)
+        if (collection.stopReason === 'global-read-unavailable' || collection.stopReason === 'memory-use-disabled') {
+          if (diagnostic.reason === 'pending') observe('scan-read', collection.stopReason === 'memory-use-disabled' ? 'memory-use-disabled' : 'read-unavailable')
+          return undefined
+        }
+        partial ||= collection.scanCapped
+        let progressed = false
+        for (const record of collection.candidates) {
+          const prior = candidates.get(record.id)
+          if (prior === undefined) {
+            progressed = true
+            if (candidates.size === 50) {
+              const last = [...candidates.values()].sort(compareGlobalRecallCandidates).at(-1)!
+              if (compareGlobalRecallCandidates(record, last) >= 0) continue
+              candidates.delete(last.id)
+            }
+            candidates.set(record.id, record)
+          } else {
+            const sameRecord = prior.revision === record.revision && prior.content === record.content
+            progressed ||= !sameRecord || record.score > prior.score || (record.routes ?? []).some((route) => !prior.routes?.includes(route))
+            candidates.set(record.id, { ...record, score: sameRecord ? Math.max(prior.score, record.score) : record.score,
+              routes: sameRecord ? [...new Set([...(prior.routes ?? []), ...(record.routes ?? [])])] : record.routes })
+          }
+        }
+        diagnostic.candidateCount = candidates.size
+        const next = collection.nextScan
+        if (next === undefined) break
+        const repeated = bookmarks.has(next)
+        bookmarks.add(next)
+        // Empty windows can traverse real sources with no query match. A repeated cursor or
+        // nonempty duplicate-only window is not evidence that more candidates were reached.
+        if (repeated || collection.candidates.length > 0 && !progressed || candidates.size === 50 || window === 5) { partial = true; break }
+        cursor = next
+      }
+      observe('packing')
+      const seen = new Set<string>()
+      const hits: RecallHit[] = [...candidates.values()].sort(compareGlobalRecallCandidates).flatMap((record) => {
+        const normalized = record.content.trim().toLocaleLowerCase()
+        if (seen.has(normalized)) return []
+        seen.add(normalized)
+        return [{ record, score: record.score }]
+      })
+      const packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits,
+        maxTokens: this.config.recall.maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
+      const selected = new Set(packet.selected)
+      diagnostic.selectedCount = selected.size
+      if (hits.length === 0) observe('packing', 'no-candidates')
+      else if (selected.size === 0) observe('packing', 'no-selection')
+      const result = this.proveGlobalRecall(hits.filter((hit) => selected.has(hit.record.id)), query, session, partial, canContinue, observe)
+      if (result !== undefined) observe('complete', 'injected')
+      return result
+    } catch {
+      // Unavailable identity/proof/clock is never permission to inject a cached body.
+      observe(diagnostic.stage, 'unexpected-error')
+      return undefined
+    } finally {
+      try { for (const bookmark of bookmarks) this.dashboardReadSessions.dropGlobalProgress(bookmark) }
+      finally { this.logGlobalRecallDiagnostic(diagnostic, started) }
+    }
+  }
+
+  private proveGlobalRecall(hits: RecallHit[], query: string, session: SessionLike, partial: boolean,
+    canContinue: () => boolean, observe?: GlobalRecallObserver): string | undefined {
+    if (hits.length === 0) return undefined
+    observe?.('proof-admission')
+    if (!canContinue()) return undefined
+    const root = realpathSync(this.stateRoot), policy = this.policyRevision()
+    const groups: Array<{ keys: string[]; hits: Array<{ hit: RecallHit; projectKey: string; id: string }> }> = []
+    for (const hit of hits) {
+      const origin = parseGlobalMemoryKey(hit.record.id)
+      if (origin === undefined) { observe?.('proof-admission', 'reference-invalid'); return undefined }
+      let group = groups.find((entry) => entry.keys.includes(origin.projectKey))
+      if (group === undefined) {
+        group = groups.find((entry) => entry.keys.length < 4)
+        if (group === undefined) {
+          if (groups.length === 2) { partial = true; continue }
+          group = { keys: [], hits: [] }; groups.push(group)
+        }
+        group.keys.push(origin.projectKey)
+      }
+      group.hits.push({ hit, ...origin })
+    }
+    const readers: DashboardVisibilityReadSession[] = [], proven: RecallHit[] = []
+    const pins = new Map<string, { dev: number; ino: number }>()
+    const currentScope = (): boolean => this.memoryUseAllowed(session) && !this.closed && !this.maintenance &&
+      realpathSync(this.stateRoot) === root && this.policyRevision() === policy && [...pins].every(([key, pin]) => {
+        const current = this.dashboardMemberPathIdentity(key)
+        return current !== undefined && current.dev === pin.dev && current.ino === pin.ino &&
+          realpathSync(path.join(root, 'projects', key)) === path.join(root, 'projects', key)
+      })
+    try {
+      for (const group of groups) {
+        observe?.('proof-admission')
+        if (!canContinue() || !currentScope() || group.keys.some((key) =>
+          realpathSync(path.join(root, 'projects', key)) !== path.join(root, 'projects', key))) {
+          observe?.('proof-admission', 'scope-unavailable'); return undefined
+        }
+        const opened = observeGlobalRecallRead(observe, 'proof-bootstrap', () => this.beginDashboardAggregateRead({ generationId: createHash('sha256').update(root).digest('hex'),
+          policyKey: policy, filterKey: createHash('sha256').update(JSON.stringify(['global-recall-proof', query])).digest('hex'),
+          asOf: Date.now(), viewKey: 'memory.global.v7', projectKeys: [] }, () => {}, true))
+        if (opened.status !== 'ok') return undefined
+        const reader = opened.value
+        readers.push(reader)
+        // Empty bootstrap proves control first. Admit each contributor through the existing
+        // charged opener, only when its candidate is reached; eager binding/advancing would
+        // spend the session's source-probe budget again for every later candidate.
+        for (const { hit, projectKey, id } of group.hits) {
+          observe?.('proof-source')
+          if (!canContinue()) return undefined
+          if (!reader.globalPublicationSources().includes(projectKey)) {
+            let selected = observeGlobalRecallRead(observe, 'proof-source', () => reader.selectGlobalSource(projectKey))
+            if (selected.status === 'budget-exhausted' && selected.reason === 'global-source-handoff-headroom') {
+              // This pre-admission stop opened nothing. Continue this same ledger once;
+              // all other failures stop without another opening or a fresh budget.
+              if (!canContinue() || observeGlobalRecallRead(observe, 'proof-continuation', () => reader.advance(true)).status !== 'ok' || !canContinue()) return undefined
+              selected = observeGlobalRecallRead(observe, 'proof-source', () => reader.selectGlobalSource(projectKey))
+            }
+            if (selected.status !== 'ok' || !canContinue()) return undefined
+            const pin = observeGlobalRecallRead(observe, 'proof-identity', () => reader.readProject(projectKey, { sqlStatements: 0, rowsVisited: 0, materializedBytes: 512, keyBytes: 256 }, (store) => store.dashboardFileIdentity()))
+            if (pin.status !== 'ok') return undefined
+            if (pin.value === undefined) { observe?.('proof-identity', 'identity-unavailable'); return undefined }
+            pins.set(projectKey, pin.value)
+          }
+          // Keep the original same-session counters/memo, reserving the final proofs.
+          // A complex root may continue its admitted stages, never start a fresh proof budget.
+          let sourceProven = false, resolved = false
+          for (let attempt = 0; attempt < 17; attempt += 1) {
+            if (!canContinue()) return undefined
+            const leaveGuard = reader.beginPersonaProofGuard(2)
+            let result: ReturnType<DashboardVisibilityReadSession['resolveRoot']>
+            try {
+              // resolveRoot may select historical evidence; also require the unchanged CURRENT head.
+              const head = sourceProven ? { status: 'ok' as const, value: 'visible' as const }
+                : observeGlobalRecallRead(observe, 'proof-head', () => reader.proveManagedPersonaSource(projectKey, id, hit.record.revision))
+              if (head.status !== 'ok') result = head
+              else if (head.value !== 'visible') result = { status: 'ok', value: { state: head.value } }
+              else {
+                sourceProven = true
+                if (!canContinue()) return undefined
+                result = observeGlobalRecallRead(observe, 'proof-body', () => reader.resolveRoot(projectKey, id, 8192))
+              }
+            } finally { leaveGuard() }
+            if (result.status === 'budget-exhausted' && result.reason === 'persona-call-headroom') {
+              if (!canContinue() || observeGlobalRecallRead(observe, 'proof-continuation', () => reader.advance(true)).status !== 'ok') return undefined
+              continue
+            }
+            if (result.status !== 'ok') return undefined
+            const record = result.value.record
+            if (result.value.state !== 'visible' || record === undefined || record.revision !== hit.record.revision || record.content !== hit.record.content) {
+              partial = true
+            } else proven.push({ record: { ...record, id: hit.record.id }, score: hit.score })
+            resolved = true
+            break
+          }
+          if (!resolved) { observe?.('proof-continuation', 'call-limit'); return undefined }
+        }
+      }
+      observe?.('packing')
+      const packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits: proven,
+        maxTokens: this.config.recall.maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
+      // Every proof session remains live until ALL selected bodies have been resolved and packed.
+      // Re-probe the earlier sessions after later reads, including their dependency TTL and fences.
+      for (const reader of readers) {
+        observe?.('proof-publication')
+        if (!canContinue() || !currentScope()) { observe?.('proof-publication', 'scope-unavailable'); return undefined }
+        let published = observeGlobalRecallRead(observe, 'proof-publication', () => reader.publishProof())
+        if (published.status === 'budget-exhausted' && published.reason === 'persona-call-headroom') {
+          if (!canContinue() || observeGlobalRecallRead(observe, 'proof-continuation', () => reader.advance(true)).status !== 'ok' || !canContinue()) return undefined
+          published = observeGlobalRecallRead(observe, 'proof-publication', () => reader.publishProof())
+        }
+        if (published.status !== 'ok') return undefined
+      }
+      if (!currentScope()) { observe?.('proof-publication', 'scope-unavailable'); return undefined }
+      if (packet.text === undefined) observe?.('packing', 'no-visible-candidates')
+      return packet.text
+    } finally {
+      for (const reader of readers) reader.cancel()
+    }
   }
 
   recall(cwd: string, userText: string, sessionId?: string, options: RecallQueryOptions = {}): RecallHit[] {
@@ -2321,6 +2602,7 @@ export class MemoryRuntime {
     globalPersona?: boolean
     extractionEveryN?: number
     extractionEnabled?: boolean
+    /** @deprecated Old daily quota inputs are ignored, never persisted or returned. */
     automaticDailyTokens?: number
     automaticDailyTasks?: number
     manualDailyTokens?: number
@@ -2332,7 +2614,7 @@ export class MemoryRuntime {
       this.generationEpoch += 1
       this.config.generateMemory = patch.generateMemory
     }
-    // A deliberate v7 ON enables its legacy subgates; initial explicit disables and zero budgets stay intact.
+    // A deliberate v7 ON enables its legacy subgates; initial explicit disables stay intact.
     if (patch.generateMemory === true) { this.config.capture.enabled = true; this.config.extraction.enabled = true }
     if (typeof patch.useMemory === 'boolean') this.config.useMemory = patch.useMemory
     if (patch.useMemory === true) this.config.recall.enabled = true
@@ -2352,25 +2634,19 @@ export class MemoryRuntime {
       this.config.extraction.enabled = patch.extractionEnabled
 
     }
-    let budgetChanged = false
-    for (const key of ['automaticDailyTokens', 'automaticDailyTasks', 'manualDailyTokens', 'manualDailyTasks'] as const) {
-      const value = patch[key]
-      if (typeof value === 'number' && Number.isFinite(value)) {
-        const next = Math.max(0, Math.min(key.endsWith('Tokens') ? 10_000_000 : 100_000, Math.floor(value)))
-        if (next !== this.config.budget[key]) budgetChanged = true
-        this.config.budget[key] = next
-      }
-    }
     try { this.persistSettings() } catch (error) {
       Object.assign(this.config, previous)
       throw error
+    }
+    if (previous.generateMemory !== this.config.generateMemory || previous.capture.enabled !== this.config.capture.enabled) {
+      for (const buffer of this.sessions.values()) { buffer.hostTurn = undefined; buffer.hostStep = undefined }
     }
     if (!this.config.generateMemory || !this.config.extraction.enabled) {
       for (const buffer of this.sessions.values()) if (buffer.timer !== undefined) { clearTimeout(buffer.timer); buffer.timer = undefined }
     } else if (patch.generateMemory === true || patch.extractionEnabled === true) {
       for (const sessionId of this.sessions.keys()) this.schedule(sessionId)
     }
-    if (this.config.generateMemory && (budgetChanged || patch.extractionEnabled === true || patch.generateMemory === true)) this.wakeExtractionQueue('settings')
+    if (this.config.generateMemory && (patch.extractionEnabled === true || patch.generateMemory === true)) this.wakeExtractionQueue('settings')
   }
 
   /**
@@ -2623,10 +2899,6 @@ export class MemoryRuntime {
           globalPersona: this.config.persona.global,
           extractionEveryN: this.config.extraction.everyNConversations,
           extractionEnabled: this.config.extraction.enabled,
-          automaticDailyTokens: this.config.budget.automaticDailyTokens,
-          automaticDailyTasks: this.config.budget.automaticDailyTasks,
-          manualDailyTokens: this.config.budget.manualDailyTokens,
-          manualDailyTasks: this.config.budget.manualDailyTasks,
         }, null, 2)}\n`,
       )
     } catch (error) {
@@ -2941,10 +3213,6 @@ export class MemoryRuntime {
         extractionEveryN: this.config.extraction.everyNConversations,
         autoApproveConfidence: this.config.autoApproveConfidence,
         extractionEnabled: this.config.extraction.enabled,
-        automaticDailyTokens: this.config.budget.automaticDailyTokens,
-        automaticDailyTasks: this.config.budget.automaticDailyTasks,
-        manualDailyTokens: this.config.budget.manualDailyTokens,
-        manualDailyTasks: this.config.budget.manualDailyTasks,
       },
       ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
     }
@@ -4852,9 +5120,14 @@ export class MemoryRuntime {
       if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('snapshot settings are not an object')
       snapshot = parsed as Record<string, unknown>
     }
+    for (const key of ['automaticDailyTokens', 'automaticDailyTasks', 'manualDailyTokens', 'manualDailyTasks', 'budget']) delete snapshot[key]
     const numberOr = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback
     const setting = {
       ...snapshot,
+      generateMemory: this.config.generateMemory && snapshot.generateMemory !== false,
+      useMemory: this.config.useMemory && snapshot.useMemory !== false,
+      captureEnabled: this.config.capture.enabled && snapshot.captureEnabled !== false,
+      recallEnabled: this.config.recall.enabled && snapshot.recallEnabled !== false,
       mode: this.config.mode,
       recallMaxTokens: Math.min(this.config.recall.maxTokens, Math.max(40, numberOr(snapshot.recallMaxTokens, this.config.recall.maxTokens))),
       dedupeSession: this.config.recall.dedupeSession || snapshot.dedupeSession === true,
@@ -4862,10 +5135,6 @@ export class MemoryRuntime {
       globalPersona: this.config.persona.global && snapshot.globalPersona !== false,
       extractionEnabled: this.config.extraction.enabled && snapshot.extractionEnabled !== false,
       extractionEveryN: Math.max(this.config.extraction.everyNConversations, Math.max(1, numberOr(snapshot.extractionEveryN, this.config.extraction.everyNConversations))),
-      automaticDailyTokens: Math.min(this.config.budget.automaticDailyTokens, Math.max(0, numberOr(snapshot.automaticDailyTokens, this.config.budget.automaticDailyTokens))),
-      automaticDailyTasks: Math.min(this.config.budget.automaticDailyTasks, Math.max(0, numberOr(snapshot.automaticDailyTasks, this.config.budget.automaticDailyTasks))),
-      manualDailyTokens: Math.min(this.config.budget.manualDailyTokens, Math.max(0, numberOr(snapshot.manualDailyTokens, this.config.budget.manualDailyTokens))),
-      manualDailyTasks: Math.min(this.config.budget.manualDailyTasks, Math.max(0, numberOr(snapshot.manualDailyTasks, this.config.budget.manualDailyTasks))),
     }
     writeFileSync(file, `${JSON.stringify(setting, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   }
@@ -5431,7 +5700,7 @@ export class MemoryRuntime {
         return { call: reconciled, usageAudit: this.control.billableUsageAudit(id),
           verification: 'recorded_not_independently_verified', reservationStillHeld: this.control.billableCallSummary().active?.id === id }
       }
-      case 'budget.summary': return { limits: this.config.budget, usage: this.control.billableCallSummary() }
+      case 'billable.summary': return this.control.billableCallSummary()
       case 'overview.repeated': {
         const from = str('from')
         const to = str('to')
@@ -5560,7 +5829,6 @@ export class MemoryRuntime {
   }
 
   private invalidateDashboardVisibilityReaders(): void {
-    this.globalRecallProgress.clear()
     for (const reader of [...this.dashboardVisibilityReaders]) reader.invalidate()
     this.dashboardVisibilityReaders.clear()
     this.closeUnusedDashboardReadOnlyStores()
@@ -5691,14 +5959,12 @@ export class MemoryRuntime {
     this.resourcesClosed = true
   }
 
-  private reserveProviderBudget(projectKey: string, purpose: string, budgetClass: 'automatic' | 'manual', reservedTokens: number,
+  private reserveProviderCall(projectKey: string, purpose: string, budgetClass: 'automatic' | 'manual', reservedTokens: number,
     identity: { jobId?: string; attemptId?: string; provider?: string; model?: string; requestHash?: string } = {}): string {
     const id = `bill_${randomUUID().replace(/-/gu, '').slice(0, 24)}`
     this.control.reserveBillableCall({
       id, projectKey, purpose, budgetClass, reservedTokens,
       ...identity,
-      dailyTokenLimit: budgetClass === 'automatic' ? this.config.budget.automaticDailyTokens : this.config.budget.manualDailyTokens,
-      dailyTaskLimit: budgetClass === 'automatic' ? this.config.budget.automaticDailyTasks : this.config.budget.manualDailyTasks,
     })
     return id
   }
@@ -5728,7 +5994,7 @@ export class MemoryRuntime {
     if (llm === undefined || route === undefined) throw new Error('no LLM route available for billable memory operation')
     const reservedTokens = estimateTokens(JSON.stringify(messages)) + maxTokens + 300
     const requestHash = requestIdentityHash(route, messages, maxTokens)
-    const callId = this.reserveProviderBudget(projectKey, purpose, 'manual', reservedTokens,
+    const callId = this.reserveProviderCall(projectKey, purpose, 'manual', reservedTokens,
       { provider: route.provider, model: route.model, requestHash })
     let dispatched = false
     let settled = false
@@ -5834,12 +6100,12 @@ function sessionCwd(session: SessionLike, stateRoot?: string): string | undefine
 
 function turnOf(event: SessionEventLike): number | undefined {
   const value = event.data?.turn
-  return typeof value === 'number' ? value : undefined
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 function stepOf(event: SessionEventLike): number | undefined {
   const value = event.data?.step
-  return typeof value === 'number' ? value : undefined
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 function originalMessageIdentityFor(

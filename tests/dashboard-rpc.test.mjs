@@ -1179,7 +1179,6 @@ test('registered plugin readDashboard settings returns exact configured values a
   await withHarness(() => createHarness(seedDashboardFixture), async (harness) => {
     const service = harness.service
     const expected = { mode: 'balanced', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-      automaticDailyTokens: 111, automaticDailyTasks: 2, manualDailyTokens: 222, manualDailyTasks: 3,
       includePersona: true, globalPersona: false }
     const updated = await callRpc(service, UPDATE_SETTINGS_ACK, { request: expected })
     assert.equal(updated.ok, true)
@@ -1221,8 +1220,7 @@ test('settings action reads the bounded in-memory projection and never invokes l
     assert.equal(settings.readId, started.readId)
     assert.equal(settings.activeProjectKey, harness.project.key)
     assert.deepEqual(Object.keys(settings.settings).sort(), [
-      'automaticDailyTasks', 'automaticDailyTokens', 'extractionEnabled', 'extractionEveryN',
-      'generateMemory', 'globalPersona', 'includePersona', 'manualDailyTasks', 'manualDailyTokens', 'mode', 'recallMaxTokens', 'useMemory',
+      'extractionEnabled', 'extractionEveryN', 'generateMemory', 'globalPersona', 'includePersona', 'mode', 'recallMaxTokens', 'useMemory',
     ])
     assert.equal(settings.settings.mode, 'review')
     assert.equal(settings.settings.extractionEnabled, false)
@@ -3749,7 +3747,6 @@ test('U09 Host Loader registers scoped codecs and Gateway dispatches bootstrap s
       assert.equal(rejectedAck.ok, false)
       assert.equal(rejectedAck.error.code, 'gateway/input-invalid')
       const expected = { mode: 'balanced', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-        automaticDailyTokens: 0, automaticDailyTasks: 0, manualDailyTokens: 0, manualDailyTasks: 0,
         includePersona: true, globalPersona: false }
       const ack = await dispatch('updateSettingsAck', { request: expected })
       assert.equal(ack.ok, true, JSON.stringify(ack.error))
@@ -4029,5 +4026,34 @@ test('Demo v7 Typert forget refuses a runtime whose writer epoch has been replac
       const store = openProjectStore(harness.root, harness.project.key)
       try { assert.equal(store.get(item.id).status, 'approved') } finally { store.close() }
     } finally { replacement.close() }
+  })
+})
+
+
+test('Memory settings RPC omits quotas and retains switch ACKs and proposal review', async () => {
+  const { createMemorySettingsMutation, readGlobalMemory } = await import('../src/client/memory-v7-model.js')
+  await withHarness(() => createHarness(() => ({})), async (harness) => {
+    const read = (request) => callRpc(harness.service, READ_DASHBOARD, { request })
+    const write = (request) => callRpc(harness.service, UPDATE_SETTINGS_ACK, { request })
+    const controller = createMemorySettingsMutation({ readDashboard: read, updateSettingsAck: write })
+    const global = () => readGlobalMemory(read, { version: 1, action: 'global', layer: 'home', query: '', year: new Date().getUTCFullYear(), timeZone: 'UTC' })
+    try {
+      for (const generateMemory of [true, false, true]) {
+        const result = await controller.save({ generateMemory })
+        assert.equal(result.kind, 'saved'); assert.equal(result.settings.generateMemory, generateMemory)
+        const page = await global()
+        assert.equal('automaticBudget' in page.global, false)
+        assert.equal(page.global.paused, !generateMemory)
+        assert.deepEqual(page.global.pauseReasons, generateMemory ? [] : ['generation_disabled'])
+        for (const key of ['automaticDailyTokens', 'automaticDailyTasks', 'manualDailyTokens', 'manualDailyTasks']) assert.equal(key in result.settings, false)
+      }
+      const proposal = await harness.tools.find((tool) => tool.name === 'memory_propose').execute({ content: 'Synthetic tool-only proposal remains unapproved.', confidence: 1 },
+        { agent: { session: { id: 'proposal', header: { cwd: harness.projectCwd } } } })
+      assert.equal(proposal.status, 'candidate'); assert.equal(proposal.usable, false)
+      assert.equal(proposal.activatedByThisCall, false); assert.equal(proposal.reason, 'pending_review')
+      const store = openProjectStoreReadOnly(harness.root, harness.project.key)
+      try { assert.equal(store.get(proposal.id).status, 'candidate'); assert.equal(store.search('tool-only proposal', 10).length, 0) }
+      finally { store.close() }
+    } finally { controller.dispose() }
   })
 })

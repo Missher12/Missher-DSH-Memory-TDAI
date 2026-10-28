@@ -81,7 +81,7 @@ test('optional Host services are read through ctx.get, not direct properties', a
       dataDir: root,
       mode: 'balanced',
       autoApproveConfidence: 0.5,
-      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0 },
+      extraction: { enabled: true, everyNConversations: 1, minTurnChars: 0, provider: 'mock', model: 'mock-model' },
       budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 },
       recall: { enabled: true, minScore: 0 },
     })

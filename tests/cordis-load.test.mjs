@@ -36,7 +36,7 @@ test('plugin loads as a real Cordis plugin with injected Host services', async (
   try {
     fiber = await root.plugin(
       { name: plugin.name, inject: plugin.inject, apply: plugin.apply },
-      { mode: 'balanced', autoApproveConfidence: 0.5, extraction: { everyNConversations: 1, minTurnChars: 0 },
+      { mode: 'balanced', autoApproveConfidence: 0.5, extraction: { everyNConversations: 1, minTurnChars: 0, provider: 'mock', model: 'mock' },
         budget: { automaticDailyTokens: 1_000_000, automaticDailyTasks: 100 } },
     )
     assert.ok(fiber)

@@ -69,26 +69,30 @@ test('contradictory usage receipts preserve the first values and leave an audit 
   }
 })
 
-test('billable calls require an explicit budget and settle only with actual usage evidence', () => {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-control-billable-'))
+test('billable calls ignore legacy daily quotas while preserving evidence and the single-call gate', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-control-unmetered-'))
   let ledger
+  const now = Date.UTC(2025, 0, 1, 12)
   try {
     ledger = new ControlLedger(root)
-    assert.throws(() => ledger.reserveBillableCall({ id: 'bill-zero', projectKey: 'project-a', purpose: 'fixture', budgetClass: 'automatic',
-      reservedTokens: 100, dailyTokenLimit: 0, dailyTaskLimit: 0, now: 1 }), /must be explicitly configured/u)
-
-    const now = Date.UTC(2025, 0, 1, 12)
-    ledger.reserveBillableCall({ id: 'bill-success', projectKey: 'project-a', purpose: 'fixture', budgetClass: 'automatic',
-      reservedTokens: 100, dailyTokenLimit: 500, dailyTaskLimit: 3, now })
-    ledger.markBillableCallDispatched('bill-success', now + 1)
-    const settled = ledger.settleBillableCall('bill-success', 'complete', { inputTokens: 70, outputTokens: 20 }, now + 2)
-    assert.equal(settled.state, 'complete')
-    assert.equal(settled.actualTokens, 90)
-    assert.deepEqual(ledger.billableCallSummary(now + 3).automatic, { tasks: 1, tokens: 90, unknown: 0 })
-  } finally {
-    ledger?.close()
-    rmSync(root, { recursive: true, force: true })
-  }
+    for (const budgetClass of ['automatic', 'manual']) {
+      let calls = 0
+      for (const limit of [undefined, 0, 1]) for (let index = 0; index < 3; index += 1) {
+        const id = `${budgetClass}-${String(limit)}-${index}`
+        const input = { id, projectKey: 'project-a', purpose: 'fixture', budgetClass,
+          reservedTokens: 100, dailyTokenLimit: limit, dailyTaskLimit: limit, now }
+        assert.equal(ledger.reserveBillableCall(input).state, 'reserved')
+        assert.throws(() => ledger.reserveBillableCall({ ...input, id: id + '-concurrent' }), /global billable request gate is held/u)
+        ledger.markBillableCallDispatched(id, now + 1)
+        const settled = ledger.settleBillableCall(id, 'complete', { inputTokens: 70, outputTokens: 20 }, now + 2)
+        assert.equal(settled.state, 'complete'); assert.equal(settled.actualTokens, 90)
+        calls += 1
+        assert.deepEqual(ledger.billableCallSummary(now + 3)[budgetClass], { tasks: calls, tokens: calls * 90, unknown: 0 })
+        assert.throws(() => ledger.reserveBillableCall(input), /UNIQUE/u, 'the same request identity cannot be reserved twice')
+        ledger.close(); ledger = new ControlLedger(root)
+      }
+    }
+  } finally { ledger?.close(); rmSync(root, { recursive: true, force: true }) }
 })
 
 test('R10 observed provider usage keeps unknown fields and conflicting observations in the content-free ledger', () => {

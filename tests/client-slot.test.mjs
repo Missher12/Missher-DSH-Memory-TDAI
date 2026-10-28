@@ -48,7 +48,6 @@ test('client bundle registers the Memory settings section through the module loa
         reason: `synthetic:${request.action}`,
         settings: {
           mode: 'review', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-          automaticDailyTokens: 111, automaticDailyTasks: 2, manualDailyTokens: 222, manualDailyTasks: 3,
           includePersona: true, globalPersona: false,
         },
       } }
@@ -155,6 +154,12 @@ test('client bundle registers the Memory settings section through the module loa
     for (const label of ['原始对话', '提炼记忆', '场景索引', '画像', '记忆活动', '最近活动']) assert.ok(pendingMarkup.includes(label))
     for (const label of ['处理状态', '召回解释', '任务接续', '经验卡', '修订关系', '决策知识', '本地评测', '用量治理', '恢复', '新建记忆']) assert.ok(!pendingMarkup.includes(label))
     assert.match(pendingMarkup, /data-unknown="true"/u, 'pending calendar cells never claim measured zero')
+    assert.match(pendingMarkup, /aria-busy="true"/u)
+    const { memoryYear } = await import('../src/client/memory-v7-model.js')
+    const pendingYear = memoryYear(new Date().getFullYear(), Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', [], false)
+    assert.equal((pendingMarkup.match(/data-day="/gu) ?? []).length, pendingYear.cells.length)
+    assert.equal((pendingMarkup.match(/data-padding="true"/gu) ?? []).length + pendingYear.cells.length, pendingYear.weeks * 7,
+      'the pending render already occupies the complete calendar grid')
 
     const previewSnapshot = {
       version: 1, generatedAt: 1, root: '.', mode: 'review',
@@ -164,8 +169,7 @@ test('client bundle registers the Memory settings section through the module loa
       globalPersona: null, longestSession: null,
       settings: { mode: 'review', recallMaxTokens: 777, recallMaxResults: 8, dedupeSession: false,
         includePersona: true, globalPersona: false, extractionEveryN: 3, autoApproveConfidence: 0.8,
-        extractionEnabled: false, automaticDailyTokens: 0, automaticDailyTasks: 0,
-        manualDailyTokens: 0, manualDailyTasks: 0 },
+        extractionEnabled: false },
     }
     const previewMarkup = renderToStaticMarkup(createElement(component, {
       ...baseProps, initialSnapshot: previewSnapshot, readDashboard: undefined, updateSettingsAck: undefined,
@@ -309,5 +313,43 @@ test('Memory activity presentation keeps a full 54-column year and separates unk
     const year = memoryYear(2024, zone, [], false, Date.parse('2024-11-03T12:00:00Z'))
     assert.equal(year.cells.length, 366); assert.equal(new Set(year.cells.map((cell) => cell.date)).size, 366)
     assert.ok(year.firstWeekday + year.cells.length <= year.weeks * 7)
+  }
+})
+
+
+test('Memory settings ignore removed quota mutations without creating a retry intent', async () => {
+  const { createMemorySettingsMutation } = await import('../src/client/memory-v7-model.js')
+  const transport = memorySettingsTransport({})
+  const controller = createMemorySettingsMutation(transport.actions)
+  try {
+    for (const value of [0, 1, 10000]) {
+      assert.deepEqual(await controller.save({ automaticDailyTokens: value, automaticDailyTasks: value }), { kind: 'ignored' })
+      assert.equal(controller.hasFailed(), false)
+    }
+    assert.deepEqual(await controller.retry(), { kind: 'ignored' })
+    assert.equal(transport.calls.filter((call) => call.action === 'save').length, 0)
+    assert.equal((await controller.save({ useMemory: false })).kind, 'saved')
+    assert.equal(transport.calls.filter((call) => call.action === 'save').length, 1)
+  } finally { controller.dispose() }
+})
+
+test('Memory calendar fills whole weeks and aligns months without inventing padding activity', async () => {
+  const { memoryYear } = await import('../src/client/memory-v7-model.js')
+  for (const [year, days] of [[2023, 365], [2024, 366], [2012, 366]]) {
+    const calendar = memoryYear(year, 'UTC', [], false, Date.UTC(year, 5, 1))
+    assert.equal(calendar.cells.length, days)
+    assert.equal(calendar.grid.length, calendar.weeks * 7)
+    assert.equal(calendar.grid.filter(Boolean).length, days)
+    assert.deepEqual(calendar.grid.slice(0, calendar.firstWeekday), Array(calendar.firstWeekday).fill(null))
+    assert.ok(calendar.grid.slice(calendar.firstWeekday + days).every((slot) => slot === null))
+    assert.deepEqual(calendar.grid.filter(Boolean), calendar.cells)
+    for (const month of calendar.months) {
+      const first = calendar.grid.findIndex((cell) => cell?.date === `${year}-${String(month.month).padStart(2, '0')}-01`)
+      assert.equal(month.column, Math.floor(first / 7) + 1)
+      assert.ok(month.span >= 1 && month.column + month.span - 1 <= calendar.weeks)
+    }
+    assert.equal(calendar.months.reduce((sum, month) => sum + month.span, 0), calendar.weeks)
+    assert.equal(calendar.cells[0].known, false); assert.equal(calendar.cells[0].count, 0)
+    assert.equal(calendar.cells.at(-1).future, true)
   }
 })

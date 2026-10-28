@@ -160,10 +160,6 @@ export const DashboardSnapshotSchema = z
         extractionEveryN: z.number(),
         autoApproveConfidence: z.number(),
         extractionEnabled: z.boolean(),
-        automaticDailyTokens: z.number(),
-        automaticDailyTasks: z.number(),
-        manualDailyTokens: z.number(),
-        manualDailyTasks: z.number(),
       })
       .strict(),
     lastError: z.string().optional(),
@@ -189,10 +185,6 @@ export const UpdateSettingsRequestSchema = z
     globalPersona: z.boolean().optional(),
     extractionEveryN: z.number().int().min(1).max(100).optional(),
     extractionEnabled: z.boolean().optional(),
-    automaticDailyTokens: z.number().int().min(0).max(10_000_000).optional(),
-    automaticDailyTasks: z.number().int().min(0).max(100_000).optional(),
-    manualDailyTokens: z.number().int().min(0).max(10_000_000).optional(),
-    manualDailyTasks: z.number().int().min(0).max(100_000).optional(),
   })
   .strict()
 
@@ -289,7 +281,7 @@ export const ManageRequestSchema = z.object({
     'revision.list', 'revision.propose', 'revision.review', 'relation.list', 'relation.repairs', 'relation.repair.propose', 'relation.propose', 'relation.review',
     'decision.impact', 'knowledge.list', 'knowledge.detail', 'knowledge.history', 'evaluation.list', 'evaluation.save', 'evaluation.run',
     'strategy.list', 'strategy.propose', 'strategy.shadow', 'strategy.select', 'strategy.rollback',
-    'attempt.list', 'attempt.reviewUnknown', 'billable.list', 'billable.reviewUnknown', 'billable.reconcileUsage', 'budget.summary', 'overview.detail',
+    'attempt.list', 'attempt.reviewUnknown', 'billable.list', 'billable.reviewUnknown', 'billable.reconcileUsage', 'billable.summary', 'overview.detail',
     'overview.repeated', 'processing.jobs', 'processing.coverage',
     'source.revoke.preview', 'source.revoke', 'content.delete.inventory', 'content.delete.preview', 'content.delete.apply',
     'recovery.snapshot', 'recovery.list', 'recovery.plan', 'recovery.apply',
@@ -424,8 +416,7 @@ export const ReadDashboardProjectSchema = z.object({ key: ProjectKeySchema, name
 export const ReadDashboardSettingsSchema = z.object({
   generateMemory: z.boolean().optional(), useMemory: z.boolean().optional(),
   mode: z.string().max(32), recallMaxTokens: z.number(), extractionEveryN: z.number().min(1).max(100),
-  extractionEnabled: z.boolean(), automaticDailyTokens: z.number(), automaticDailyTasks: z.number(),
-  manualDailyTokens: z.number(), manualDailyTasks: z.number(), includePersona: z.boolean(), globalPersona: z.boolean(),
+  extractionEnabled: z.boolean(), includePersona: z.boolean(), globalPersona: z.boolean(),
 }).strict()
 
 export const ReadDashboardPagePersonaSchema = z.object({
@@ -605,6 +596,7 @@ export const GlobalMemoryPageSchema = z.object({
   recentAdded: ReadDashboardMetricSchema,
   activityComplete: z.boolean(), year: z.number(), timeZone: z.string(),
   generateMemory: z.boolean(), useMemory: z.boolean(), paused: z.boolean(),
+  pauseReasons: z.array(z.enum(['generation_disabled', 'capture_disabled', 'extraction_disabled'])).max(3).optional(),
 }).strict()
 export type GlobalMemoryItem = z.infer<typeof GlobalMemoryItemSchema>
 export type GlobalMemoryPage = z.infer<typeof GlobalMemoryPageSchema>

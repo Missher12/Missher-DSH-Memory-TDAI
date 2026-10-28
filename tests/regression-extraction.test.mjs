@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -302,8 +302,21 @@ test('in-flight captures never jump ahead of older durable backlog rows', async 
       'durable oldest-first order wins; in-flight captures never jump ahead of older backlog',
     )
     const store2 = openProjectStore(root, project.key, project)
-    assert.equal(store2.unextracted('s1').length, 0)
-    store2.close()
+    try {
+      // The first batch's queued wake can already own the second extraction;
+      // runExtraction then returns early, so await its durable completion here.
+      const deadline = performance.now() + 5000
+      let jobs = store2.extractionJobs(3)
+      while (jobs.length !== 2 || jobs.some((job) => job.status !== 'completed')) {
+        assert.ok(jobs.length <= 2 && jobs.every((job) => ['queued', 'ready', 'dispatching', 'result_ready', 'completed'].includes(job.status)),
+          'the two batches must not fail, become uncertain, or create an extra job')
+        assert.ok(performance.now() < deadline, 'both queued extraction batches must reach durable completion within 5 seconds')
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        jobs = store2.extractionJobs(3)
+      }
+      assert.equal(scripted.calls.length, 2, 'exactly two mock calls consume the backlog and in-flight capture')
+      assert.equal(store2.unextracted('s1').length, 0)
+    } finally { store2.close() }
   } finally {
     runtime?.close()
     rmSync(root, { recursive: true, force: true })
@@ -432,4 +445,127 @@ test('late extraction response is not accepted into a replacement session buffer
     runtime.onSessionEvent(session, { type: 'session/disposed', seq: 3, data: {} })
     runtime.onSessionEvent(session, { type: 'session/header', seq: 4, data: {} })
   })
+})
+
+
+test('committed same-turn routes skip a stale header while legacy zero quotas do not block dispatch', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-zero-'))
+  const cwd = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-zero-project-'))
+  const config = resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1 },
+    budget: { automaticDailyTokens: 0, automaticDailyTasks: 0 }, recall: { enabled: true, minScore: 0 } })
+  let header = { config: { provider: 'mock', model: 'old-turn' } }
+  const session = { id: 'route-zero', header: { cwd, agentPreset: 'agent-mock' }, requestHeader: () => header }
+  const mock = scriptedContext({ session, config, script: [oneMemory('用户偏好使用 pnpm 管理依赖。', 'preference')] })
+  let runtime, store
+  try {
+    runtime = new MemoryRuntime(mock.ctx, config, root)
+    runtime.onSessionEvent(session, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+    runtime.onSessionEvent(session, { type: 'step/start', seq: 2, data: { turn: 1, step: 1 } })
+    runtime.onSessionEvent(session, userEvent(3, '这是没有提交路由的上一回合来源。'))
+    runtime.onSessionEvent(session, { type: 'turn/end', seq: 4, data: { turn: 1 } })
+    store = openProjectStore(root, projectIdentity(cwd).key, projectIdentity(cwd))
+    const oldJob = store.extractionJobs()[0]
+    assert.equal(oldJob.provider, undefined, 'the existing requestHeader alone cannot route a new turn')
+    runtime.onSessionEvent(session, { type: 'turn/start', seq: 5, data: { turn: 2 } })
+    runtime.onSessionEvent(session, { type: 'step/start', seq: 6, data: { turn: 2, step: 1 } })
+    runtime.onSessionEvent(session, userEvent(7, '以后请始终使用 pnpm 管理前端依赖。'))
+    // No new header event: unchanged Host routes are proved by the committed assistant response.
+    runtime.onSessionEvent(session, { type: 'assistant/message', seq: 8, data: { turn: 2, step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: '已收到这个偏好。' }], source: { provider: 'mock', model: 'old-turn' } } } })
+    runtime.onSessionEvent(session, { type: 'turn/end', seq: 9, data: { turn: 2 } })
+    await withAdvancedClock(2000, async () => {
+      await runtime.runExtraction(session.id)
+      assert.equal(mock.calls.length, 1, 'an established route dispatches despite legacy zero quotas')
+      assert.equal('budget' in runtime.config, false)
+      const ready = store.extractionJobs().find((job) => job.id !== oldJob.id)
+      assert.equal(ready.status, 'completed')
+      assert.equal(store.getExtractionJob(oldJob.id).provider, undefined)
+      runtime.updateSettings({ automaticDailyTokens: 0, automaticDailyTasks: 0 })
+      await runtime.runExtraction(session.id, true)
+      assert.equal(mock.calls.length, 1, 'legacy quota input cannot redispatch a completed job')
+      assert.equal(mock.calls[0].model, 'old-turn')
+      assert.equal(store.getExtractionJob(oldJob.id).status, 'queued')
+      assert.equal(runtime.recall(cwd, 'pnpm').length, 1)
+    })
+  } finally { store?.close(); runtime?.close(); rmSync(root, { recursive: true, force: true }); rmSync(cwd, { recursive: true, force: true }) }
+})
+
+
+test('route binding rejects conflicting headers missing event continuity and closed or disabled turns', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-negative-'))
+  const cwd = mkdtempSync(path.join(os.tmpdir(), 'tdai-route-negative-project-'))
+  const config = resolveConfig({ extraction: { minTurnChars: 0, everyNConversations: 1 }, budget: { automaticDailyTokens: 0, automaticDailyTasks: 0 } })
+  const mock = scriptedContext({ config, script: [] })
+  let runtime, store
+  try {
+    runtime = new MemoryRuntime(mock.ctx, config, root)
+    store = openProjectStore(root, projectIdentity(cwd).key, projectIdentity(cwd))
+    for (const defect of ['conflict', 'gap', 'wrong-turn', 'closed', 'disabled']) {
+      const header = { config: { provider: 'mock', model: 'committed' } }
+      const session = { id: defect, header: { cwd, agentPreset: 'agent-mock' }, requestHeader: () => header }
+      mock.setSession(session)
+      runtime.onSessionEvent(session, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+      runtime.onSessionEvent(session, { type: 'step/start', seq: 2, data: { turn: 1, step: 1 } })
+      runtime.onSessionEvent(session, userEvent(3, `请记录 synthetic ${defect} preference.`))
+      if (defect === 'closed') runtime.onSessionEvent(session, { type: 'turn/end', seq: 4, data: { turn: 1 } })
+      if (defect === 'disabled') { runtime.updateSettings({ generateMemory: false }); runtime.updateSettings({ generateMemory: true }) }
+      if (defect === 'wrong-turn') runtime.onSessionEvent(session, { type: 'assistant/message', seq: 4, data: { turn: 2, step: 1,
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Another turn response.' }], source: { provider: 'mock', model: 'committed' } } } })
+      else runtime.onSessionEvent(session, { type: 'request/header', seq: defect === 'gap' ? 7 : defect === 'closed' ? 5 : 4,
+        data: { header: defect === 'conflict' ? { config: { provider: 'mock', model: 'different' } } : header, reason: 'change' } })
+      const bindings = store.db.prepare('SELECT provider, request_seq FROM extraction_source_routes WHERE session_id = ?').all(session.id)
+      assert.ok(bindings.length >= 1)
+      assert.ok(bindings.every((binding) => binding.provider === null && binding.request_seq === null), defect)
+    }
+    assert.equal(mock.calls.length, 0)
+  } finally { store?.close(); runtime?.close(); rmSync(root, { recursive: true, force: true }); rmSync(cwd, { recursive: true, force: true }) }
+})
+
+
+test('legacy zero and small quotas allow cumulative extraction and persona calls across restart without parallel dispatch', async () => {
+  for (const limit of [0, 1]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-unmetered-runtime-'))
+    const cwd = mkdtempSync(path.join(os.tmpdir(), 'tdai-unmetered-project-'))
+    const legacy = { automaticDailyTokens: limit, automaticDailyTasks: limit, manualDailyTokens: limit, manualDailyTasks: limit }
+    const raw = { extraction: { provider: 'mock', model: 'mock-model', minTurnChars: 0, everyNConversations: 1 }, budget: legacy }
+    const session = { id: 'unmetered', header: { cwd, agentPreset: 'agent-mock' } }
+    const texts = ['用户偏好 pnpm 管理前端依赖。', '用户偏好 Vitest 编写单元测试。', '用户偏好用中文编写项目文档。']
+    const gate = meteredGatedStream('用户偏好 pnpm、Vitest 和中文文档。')
+    const mock = scriptedContext({ session, script: [...texts.map((text) => oneMemory(text, 'preference')),
+      gate.stream, meteredStream('用户偏好来源已核实的前端工作流。')] })
+    let runtime, pending
+    try {
+      writeFileSync(path.join(root, 'settings.json'), JSON.stringify({ ...legacy, generateMemory: true, useMemory: true, extractionEnabled: true }))
+      runtime = new MemoryRuntime(mock.ctx, resolveConfig(raw), root)
+      for (let n = 0; n < texts.length; n += 1) {
+        const seq = n * 2000 + 1
+        runtime.onSessionEvent(session, userEvent(seq, texts[n]))
+        endTurnAfterQuietWindow(runtime, session, seq + 1)
+        await runtime.runExtraction(session.id)
+        assert.equal(mock.calls.length, n + 1)
+        assert.equal('budget' in runtime.config, false)
+        if (n === 0) { runtime.close(); runtime = new MemoryRuntime(mock.ctx, resolveConfig(raw), root) }
+      }
+      const key = projectIdentity(cwd).key
+      pending = runtime.refreshPersona(key)
+      await Promise.resolve()
+      assert.equal(mock.calls.length, 4)
+      await assert.rejects(runtime.refreshPersona(key), /global billable request gate is held/u)
+      assert.equal(mock.calls.length, 4, 'a concurrent manual call does not reach the provider')
+      gate.release(); await pending; pending = undefined
+      await runtime.refreshPersona(key)
+      assert.equal(mock.calls.length, 5)
+      const usage = runtime.control.billableCallSummary()
+      assert.deepEqual(usage.automatic, { tasks: 3, tokens: 216, unknown: 0 })
+      assert.deepEqual(usage.manual, { tasks: 2, tokens: 144, unknown: 0 })
+      assert.equal(usage.active, undefined)
+      runtime.updateSettings({ generateMemory: false, useMemory: false })
+      await assert.rejects(runtime.refreshPersona(key), /generation is disabled/u)
+      assert.equal(runtime.globalRecall('pnpm', session), undefined)
+      assert.equal(mock.calls.length, 5, 'explicit OFF remains effective without a quota')
+    } finally {
+      gate.release(); await pending?.catch(() => {})
+      runtime?.close(); rmSync(root, { recursive: true, force: true }); rmSync(cwd, { recursive: true, force: true })
+    }
+  }
 })

@@ -427,7 +427,7 @@ export function registerMemoryTools(ctx: { tools?: { register(definition: ToolDe
     tool({
       name: 'memory_propose',
       description:
-        'Propose one durable memory for this project. The proposal enters the review queue unless the operator configured automatic approval; it never becomes visible to future turns immediately.',
+        'Propose one durable memory for this project. The proposal is an unapproved candidate. It is not usable in future turns until its sources and acceptance are verified; submitting this tool never approves it.',
       parameters: {
         type: 'object',
         properties: {
@@ -456,7 +456,9 @@ export function registerMemoryTools(ctx: { tools?: { register(definition: ToolDe
         const validFrom = args.valid_from === undefined ? undefined : args.valid_from === null || typeof args.valid_from === 'number' || typeof args.valid_from === 'string'
           ? args.valid_from : (() => { throw new Error('valid_from must be null, a string, or a number') })()
         const record = runtime.propose(cwdOf(exec, runtime), content, kind, confidence, validFrom)
-        return { id: record.id, status: record.status, content: record.content }
+        return { id: record.id, status: record.status, content: record.content, activatedByThisCall: false,
+          ...(record.status === 'candidate' ? { usable: false, reason: 'pending_review', message: '已保存为待审核候选，尚未生效；不会自动用于其他会话。' }
+            : { reason: 'existing_record', message: '返回已有记录；本次提交没有改变其审核状态或召回资格。' }) }
       },
     }),
   )

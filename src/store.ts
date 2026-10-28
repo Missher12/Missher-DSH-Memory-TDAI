@@ -22,7 +22,7 @@ import type { DashboardReadVersionStamp } from './dashboard-read.js'
 
 const require = createRequire(import.meta.url)
 
-export const MEMORY_SCHEMA_VERSION = 9
+export const MEMORY_SCHEMA_VERSION = 10
 
 const DASHBOARD_ORIGIN_MAX_INDEXES = 16
 const DASHBOARD_ORIGIN_INDEX_LIST_LIMIT = DASHBOARD_ORIGIN_MAX_INDEXES + 1
@@ -720,6 +720,12 @@ function loadJieba(): { cut(text: string, hmm?: boolean): string[] } | undefined
   return jiebaRuntime
 }
 
+/** Resolve the optional tokenizer once, before a runtime exposes latency-bounded reads.
+ * A failed optional dependency remains cached as the existing fallback for this process. */
+export function initializeTokenizer(): 'jieba' | 'fallback' {
+  return loadJieba() === undefined ? 'fallback' : 'jieba'
+}
+
 function fallbackTokens(text: string): string[] {
   return text.toLowerCase().match(/[\p{Script=Han}]|[\p{L}\p{N}]+/gu) ?? []
 }
@@ -1055,7 +1061,8 @@ export class MemoryStore {
         const versionText = typeof meta?.value === 'string' && meta.value_bytes === Buffer.byteLength(meta.value, 'utf8') &&
           /^(0|[1-9][0-9]*)$/u.test(meta.value) ? meta.value : undefined
         const recordedVersion = versionText === undefined ? Number.NaN : Number(versionText)
-        if (userVersion !== MEMORY_SCHEMA_VERSION || recordedVersion !== MEMORY_SCHEMA_VERSION ||
+        // Schema 10 only adds private extraction provenance; v9 read projections remain compatible.
+        if (![9, MEMORY_SCHEMA_VERSION].includes(userVersion) || recordedVersion !== userVersion ||
             requiredTables.some((table) => !tables.has(table))) {
           throw new Error('read-only project store is missing, unsupported, or awaiting schema migration')
         }
@@ -1409,6 +1416,16 @@ export class MemoryStore {
         assigned_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS extraction_job_sources_job ON extraction_job_sources(job_id, source_id);
+      -- Capture provenance is immutable; late route evidence never rewrites the original L0 event.
+      CREATE TABLE IF NOT EXISTS extraction_source_routes (
+        source_id TEXT PRIMARY KEY REFERENCES l0_messages(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL, turn INTEGER NOT NULL, step INTEGER NOT NULL,
+        capture_seq INTEGER NOT NULL, request_seq INTEGER, evidence_kind TEXT,
+        provider TEXT, model TEXT
+      );
+      CREATE INDEX IF NOT EXISTS extraction_source_routes_pending
+        ON extraction_source_routes(session_id, turn, step, request_seq, capture_seq);
+
       CREATE TABLE IF NOT EXISTS memory_relations (
         id TEXT PRIMARY KEY,
         from_id TEXT NOT NULL,
@@ -2203,12 +2220,92 @@ export class MemoryStore {
     return Number(result.changes ?? 0)
   }
 
+  /** Record only the live, ordered Host turn/step enclosing this exact newly captured source. */
+  recordSourceRequestContext(input: { sourceId: string; sessionId: string; turn: number; step: number; seq: number }): void {
+    this.ensureOpen()
+    if (![input.turn, input.step, input.seq].every((n) => Number.isSafeInteger(n) && n >= 0)) return
+    this.db.prepare(`INSERT OR IGNORE INTO extraction_source_routes(source_id, session_id, turn, step, capture_seq)
+      SELECT id, session_id, ?, ?, ? FROM l0_messages WHERE id = ? AND project_key = ? AND session_id = ?
+        AND extracted_at IS NULL AND provider IS NULL AND model IS NULL
+        AND (turn IS NULL OR turn = ?) AND (step IS NULL OR step = ?)`)
+      .run(input.turn, input.step, input.seq, input.sourceId, projectKeyOfFile(this.file), input.sessionId, input.turn, input.step)
+  }
+
+  /** Bind a committed request only to observed sources in its own session/turn/step.
+   * Already frozen, paid or uncertain jobs are never rewritten or requeued.
+   */
+  bindCommittedSourceRoute(input: { sessionId: string; turn: number; step: number; seq: number;
+    kind: 'request/header' | 'assistant/message'; provider: string; model: string }): number {
+    this.ensureOpen()
+    if (![input.turn, input.step, input.seq].every((n) => Number.isSafeInteger(n) && n >= 0) ||
+        !input.provider.trim() || !input.model.trim()) return 0
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // Each request binds at most one extraction batch. Repeated calls drain only this proven prefix.
+      const sources = this.db.prepare(`SELECT r.source_id, j.id AS job_id FROM extraction_source_routes r
+        JOIN l0_messages l ON l.id = r.source_id
+        LEFT JOIN extraction_job_sources js ON js.source_id = l.id
+        LEFT JOIN extraction_jobs j ON j.id = js.job_id
+        WHERE r.session_id = ? AND l.session_id = r.session_id AND l.project_key = ?
+          AND r.turn = ? AND r.step = ? AND r.capture_seq <= ? AND r.request_seq IS NULL
+          AND l.extracted_at IS NULL AND l.provider IS NULL AND l.model IS NULL
+          AND (j.id IS NULL OR (j.status = 'queued' AND j.attempt_id IS NULL
+            AND j.session_id = r.session_id AND js.session_id = r.session_id
+            AND j.route_provider IS NULL AND j.route_model IS NULL))
+        ORDER BY r.capture_seq LIMIT 24`)
+        .all(input.sessionId, projectKeyOfFile(this.file), input.turn, input.step, input.seq) as Array<{ source_id: string; job_id?: string | null }>
+      const owners = new Map<string, string[]>()
+      for (const source of sources) {
+        this.db.prepare(`UPDATE extraction_source_routes SET request_seq = ?, evidence_kind = ?, provider = ?, model = ?
+          WHERE source_id = ? AND request_seq IS NULL`).run(input.seq, input.kind, input.provider, input.model, source.source_id)
+        if (source.job_id) owners.set(source.job_id, [...(owners.get(source.job_id) ?? []), source.source_id])
+      }
+      for (const [id, bound] of owners) {
+        const job = this.getExtractionJob(id)!
+        if (!bound.every((sourceId) => job.sourceIds.includes(sourceId))) throw new Error('route binding source ownership is inconsistent')
+        const selected = new Set(bound), remaining = job.sourceIds.filter((sourceId) => !selected.has(sourceId))
+        if (remaining.length === 0) {
+          this.db.prepare(`UPDATE extraction_jobs SET route_provider = ?, route_model = ?, error = NULL WHERE id = ?`)
+            .run(input.provider, input.model, id)
+        } else {
+          // A legacy no-route batch may contain several turns. Split only proven sources, preserving all others.
+          const routedId = `job_${randomUUID().replace(/-/g, '').slice(0, 20)}`
+          this.db.prepare(`UPDATE extraction_jobs SET source_ids = ? WHERE id = ?`).run(JSON.stringify(remaining), id)
+          this.db.prepare(`INSERT INTO extraction_jobs(id, session_id, policy_revision, status, created_at, updated_at,
+            quiet_until, must_run_by, source_ids, input_snapshot, route_provider, route_model, agent_preset)
+            VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '[]', ?, ?, ?)`)
+            .run(routedId, job.sessionId, job.policyRevision, job.createdAt, job.updatedAt, job.quietUntil, job.mustRunBy,
+              JSON.stringify(bound), input.provider, input.model, job.agentPreset ?? null)
+          for (const sourceId of bound) this.db.prepare(`UPDATE extraction_job_sources SET job_id = ? WHERE source_id = ? AND job_id = ?`)
+            .run(routedId, sourceId, id)
+        }
+      }
+      this.db.exec('COMMIT')
+      return sources.length
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+  }
+
+  /** Sources already owned by any job, including failed/uncertain jobs, cannot starve fresh sources. */
+  pendingExtractionSources(sessionId: string, limit = 24): Array<{ id: string; sourceEventId?: string }> {
+    this.ensureOpen()
+    const rows = this.db.prepare(`SELECT l.id, l.source_event_id FROM l0_messages l
+      LEFT JOIN extraction_source_routes r ON r.source_id = l.id
+      WHERE l.session_id = ? AND l.extracted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM extraction_job_sources js JOIN extraction_jobs j ON j.id = js.job_id WHERE js.source_id = l.id)
+      ORDER BY (COALESCE(l.provider, r.provider) IS NOT NULL AND COALESCE(l.model, r.model) IS NOT NULL) DESC,
+        l.created_at, l.rowid LIMIT ?`).all(sessionId, Math.max(1, Math.min(24, limit))) as Array<{ id: string; source_event_id?: string }>
+    return rows.map((row) => ({ id: row.id, ...(row.source_event_id == null ? {} : { sourceEventId: row.source_event_id }) }))
+  }
+
   enqueueExtractionJob(input: { sessionId: string; sourceId: string; policyRevision: string; quietMs: number; maxWaitMs: number; now?: number }): ExtractionJob {
     this.ensureOpen()
     const now = input.now ?? Date.now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const source = this.db.prepare('SELECT created_at, extracted_at, provider, model, agent_preset FROM l0_messages WHERE id = ? AND project_key = ? AND session_id = ?')
+      const source = this.db.prepare(`SELECT l.created_at, l.extracted_at, COALESCE(l.provider, r.provider) AS provider,
+        COALESCE(l.model, r.model) AS model, l.agent_preset FROM l0_messages l
+        LEFT JOIN extraction_source_routes r ON r.source_id = l.id AND r.session_id = l.session_id
+        WHERE l.id = ? AND l.project_key = ? AND l.session_id = ?`)
         .get(input.sourceId, projectKeyOfFile(this.file), input.sessionId) as { created_at?: number; extracted_at?: number | null; provider?: string | null; model?: string | null; agent_preset?: string | null } | undefined
       if (source === undefined) throw new Error('cannot queue extraction: source is missing or outside the session scope')
       if (source.extracted_at !== null && source.extracted_at !== undefined) throw new Error('cannot queue extraction: source was already consumed')
@@ -2223,7 +2320,8 @@ export class MemoryStore {
       }
       const current = this.db.prepare(
         `SELECT * FROM extraction_jobs WHERE session_id = ? AND policy_revision = ? AND status = 'queued'
-         AND route_provider IS ? AND route_model IS ? AND agent_preset IS ? ORDER BY created_at ASC LIMIT 1`,
+         AND route_provider IS ? AND route_model IS ? AND agent_preset IS ?
+         AND json_array_length(source_ids) < 24 ORDER BY created_at ASC LIMIT 1`,
       ).get(input.sessionId, input.policyRevision, source.provider ?? null, source.model ?? null, source.agent_preset ?? null) as Record<string, unknown> | undefined
       const quietUntil = now + Math.max(0, input.quietMs)
       if (current !== undefined) {
@@ -2293,25 +2391,20 @@ export class MemoryStore {
 
   nextActionableExtractionJob(sessionId: string, now = Date.now(), wakeGateHeld = false, forceDeferred = false): ExtractionJob | undefined {
     this.ensureOpen()
-    const budgetBlocked = `COALESCE((error LIKE 'daily % limit reached%' OR error LIKE 'daily % budget exhausted%' OR
-      error LIKE 'estimated request reservation % exceeds the configured daily%' OR
-      error LIKE '%daily token and task budgets must be explicitly configured%'), 0)`
     const deferredReady = forceDeferred
       ? "status IN ('ready','result_ready')"
       : `(status IN ('ready','result_ready') AND (
-          (updated_at + 30000 <= ? AND NOT (${budgetBlocked})) OR
-          (updated_at + 30000 <= ? AND MAX(updated_at + 30000, (CAST(updated_at / 86400000 AS INTEGER) + 1) * 86400000) <= ? AND (${budgetBlocked})) OR
+          updated_at + 30000 <= ? OR
           (? = 1 AND error LIKE 'global billable request gate is held%')
         ))`
     const params: unknown[] = [sessionId]
-    if (!forceDeferred) params.push(now, now, now, wakeGateHeld ? 1 : 0)
+    if (!forceDeferred) params.push(now, wakeGateHeld ? 1 : 0)
     const row = this.db.prepare(
       `SELECT * FROM extraction_jobs WHERE session_id = ? AND (
-        ${deferredReady} OR (status = 'queued' AND (quiet_until <= ? OR must_run_by <= ?)))
+        ${deferredReady} OR (status = 'queued' AND length(route_provider) > 0 AND length(route_model) > 0
+          AND (quiet_until <= ? OR must_run_by <= ?)))
        ORDER BY CASE WHEN status = 'queued' THEN MIN(quiet_until, must_run_by)
                      WHEN error LIKE 'global billable request gate is held%' AND ? = 1 THEN ?
-                     WHEN (${budgetBlocked})
-                       THEN MAX(updated_at + 30000, (CAST(updated_at / 86400000 AS INTEGER) + 1) * 86400000)
                      ELSE updated_at + 30000 END ASC, created_at ASC LIMIT 1`,
     ).get(...params, now, now, wakeGateHeld ? 1 : 0, now) as Record<string, unknown> | undefined
     return row === undefined ? undefined : toExtractionJob(row)
@@ -2470,12 +2563,9 @@ export class MemoryStore {
     this.ensureOpen()
     const row = this.db.prepare(
       `SELECT MIN(CASE WHEN status = 'queued' THEN MIN(quiet_until, must_run_by)
-                       WHEN error LIKE 'daily % limit reached%' OR error LIKE 'daily % budget exhausted%' OR
-                            error LIKE 'estimated request reservation % exceeds the configured daily%' OR
-                            error LIKE '%daily token and task budgets must be explicitly configured%'
-                         THEN MAX(updated_at + 30000, (CAST(updated_at / 86400000 AS INTEGER) + 1) * 86400000)
                        ELSE updated_at + 30000 END) AS due
-       FROM extraction_jobs WHERE session_id = ? AND status IN ('queued','ready','result_ready')`,
+       FROM extraction_jobs WHERE session_id = ? AND (status IN ('ready','result_ready') OR
+         (status = 'queued' AND length(route_provider) > 0 AND length(route_model) > 0))`,
     ).get(sessionId) as { due?: number | null } | undefined
     return row?.due === undefined || row.due === null ? undefined : Number(row.due)
   }

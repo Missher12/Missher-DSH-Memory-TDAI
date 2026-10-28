@@ -38,7 +38,7 @@ function openInterruptedObservedCall(root, cwd, usage) {
   try {
     runtime.status(cwd)
     runtime.control.reserveBillableCall({ id: callId, projectKey: project.key, purpose: 'project_persona', budgetClass: 'manual',
-      reservedTokens: 512, dailyTokenLimit: config.budget.manualDailyTokens, dailyTaskLimit: config.budget.manualDailyTasks,
+      reservedTokens: 512,
       provider: 'mock', model: 'mock-model', requestHash, now })
     runtime.control.markBillableCallDispatched(callId, now + 1)
     runtime.control.recordBillableUsageObservation({ callId, projectKey: project.key, purpose: 'project_persona',

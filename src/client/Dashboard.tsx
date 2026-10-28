@@ -19,10 +19,6 @@ export interface DashboardActions {
     includePersona?: boolean
     extractionEveryN?: number
     extractionEnabled?: boolean
-    automaticDailyTokens?: number
-    automaticDailyTasks?: number
-    manualDailyTokens?: number
-    manualDailyTasks?: number
     globalPersona?: boolean
   }) => Promise<DashboardSnapshot>
   updateSettingsAck?: (request: UpdateSettingsRequest) => Promise<ReadDashboardAck>
@@ -1118,8 +1114,8 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
           return { evaluation, strategies }
         }
         case 'governance': {
-          const [attempts, billableCalls, budget] = await Promise.all([read('attempt.list'), read('billable.list'), read('budget.summary')])
-          return { attempts, billableCalls, budget }
+          const [attempts, billableCalls, billableUsage] = await Promise.all([read('attempt.list'), read('billable.list'), read('billable.summary')])
+          return { attempts, billableCalls, billableUsage }
         }
         case 'recovery': return { recovery: await read('recovery.list') }
         case 'settings': return { contentInventory: await read('content.delete.inventory') }
@@ -2191,24 +2187,6 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
           onInvalid={(message) => setSettingsNotice(message)} />
         <label className="tdai-check"><input type="checkbox" checked={settingsValue.extractionEnabled} disabled={disabled}
           onChange={(event) => void saveSettings({ extractionEnabled: event.currentTarget.checked }, event.currentTarget.checked ? 'extraction enabled' : 'automatic extraction paused')} /><span>启用自动提取（关闭后仅停止自动排程）</span></label>
-        <div className="tdai-panel-head"><h3>每日调用预算</h3><span>0 表示暂停该类调用</span></div>
-        <div className="tdai-budget-row"><strong>自动提取</strong>
-          <SettingsNumberField label="Token" value={settingsValue.automaticDailyTokens} minimum={0} maximum={10000000}
-            disabled={disabled} resetToken={settingsReadRevision} onCommit={(value) => void saveSettings({ automaticDailyTokens: value }, '自动预算已保存')}
-            onInvalid={(message) => setSettingsNotice(message)} />
-          <SettingsNumberField label="任务" value={settingsValue.automaticDailyTasks} minimum={0} maximum={100000}
-            disabled={disabled} resetToken={settingsReadRevision} onCommit={(value) => void saveSettings({ automaticDailyTasks: value }, '自动预算已保存')}
-            onInvalid={(message) => setSettingsNotice(message)} />
-        </div>
-        <div className="tdai-budget-row"><strong>手动画像/操作</strong>
-          <SettingsNumberField label="Token" value={settingsValue.manualDailyTokens} minimum={0} maximum={10000000}
-            disabled={disabled} resetToken={settingsReadRevision} onCommit={(value) => void saveSettings({ manualDailyTokens: value }, '手动预算已保存')}
-            onInvalid={(message) => setSettingsNotice(message)} />
-          <SettingsNumberField label="任务" value={settingsValue.manualDailyTasks} minimum={0} maximum={100000}
-            disabled={disabled} resetToken={settingsReadRevision} onCommit={(value) => void saveSettings({ manualDailyTasks: value }, '手动预算已保存')}
-            onInvalid={(message) => setSettingsNotice(message)} />
-        </div>
-        <p className="tdai-muted">本插件 control 账本内的自动与手动请求共用单调用闸门；未知用量继续占用预留，0 预算会暂停对应类别。它不协调其他插件的调用。</p>
         <p className="tdai-muted">每次请求都会按当前批准状态、修订、排除和遗忘规则重建有界记忆块；缺少 Host 保留回执时不会跳过重读。旧版会话去重设置仅为兼容保留。</p>
       </>}
       <label className="tdai-check"><input type="checkbox" checked={settingsValue.includePersona} disabled={disabled}
@@ -2321,9 +2299,7 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
   const deletionMemoryOptions = asRecords(contentInventory.memories)
   const deletionSourceOptions = asRecords(contentInventory.sources)
   const deletionOffloadOptions = displayList(contentInventory.offloadIds)
-  const budgetState = asRecord(manageData.budget)
-  const budgetLimits = asRecord(budgetState.limits)
-  const budgetUsage = asRecord(budgetState.usage)
+  const billableUsage = asRecord(manageData.billableUsage)
   const recoveryItems = asRecords(manageData.recovery)
   const processingJobsPage = asRecord(manageData.processingJobsPage)
   const processingCoveragePage = asRecord(manageData.processingCoveragePage)
@@ -2967,15 +2943,13 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
         </>}
 
         {activeView === 'governance' && <>
-          <section className="tdai-panel"><div className="tdai-panel-head"><h3>预算与调用闸门</h3><span>Token 估计上限不等同于金额</span></div>
+          <section className="tdai-panel"><div className="tdai-panel-head"><h3>用量与调用状态</h3><span>今日已记录用量与在途估计</span></div>
             <dl className="tdai-facts">
-              <div><dt>自动额度</dt><dd>{String(budgetLimits.automaticDailyTokens ?? 0)} tokens / {String(budgetLimits.automaticDailyTasks ?? 0)} 次每日</dd></div>
-              <div><dt>手动额度</dt><dd>{String(budgetLimits.manualDailyTokens ?? 0)} tokens / {String(budgetLimits.manualDailyTasks ?? 0)} 次每日</dd></div>
-              <div><dt>自动已用/预留</dt><dd>{String(asRecord(budgetUsage.automatic).tokens ?? 0)} tokens · {String(asRecord(budgetUsage.automatic).tasks ?? 0)} 次</dd></div>
-              <div><dt>手动已用/预留</dt><dd>{String(asRecord(budgetUsage.manual).tokens ?? 0)} tokens · {String(asRecord(budgetUsage.manual).tasks ?? 0)} 次</dd></div>
-              <div><dt>当前全局调用</dt><dd>{asRecord(budgetUsage.active).id ? String(asRecord(budgetUsage.active).state) : '空闲'}</dd></div>
+              <div><dt>自动已用/预留</dt><dd>{String(asRecord(billableUsage.automatic).tokens ?? 0)} tokens · {String(asRecord(billableUsage.automatic).tasks ?? 0)} 次</dd></div>
+              <div><dt>手动已用/预留</dt><dd>{String(asRecord(billableUsage.manual).tokens ?? 0)} tokens · {String(asRecord(billableUsage.manual).tasks ?? 0)} 次</dd></div>
+              <div><dt>当前全局调用</dt><dd>{asRecord(billableUsage.active).id ? String(asRecord(billableUsage.active).state) : '空闲'}</dd></div>
             </dl>
-            <p className="tdai-muted">预算在“配置”页设置。用量未知时保留额度；人工核实只记审计，不会释放预留或触发重试。</p>
+            <p className="tdai-muted">不设每日 Token 或任务配额。未知调用继续持有防重闸门；人工核实只记审计，不会自动重试。</p>
           </section>
           <section className="tdai-panel"><div className="tdai-panel-head"><h3>调用尝试</h3><span>{governanceAttempts.length} 项</span></div>
             <div className="tdai-list">{governanceAttempts.map((item) => <article className="tdai-memory" key={String(item.id)}>
@@ -2998,7 +2972,7 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
               {item.state === 'uncertain' && <button type="button" disabled={manageBusy} onClick={() => setBillableCallId(String(item.id))}>审计此未知调用</button>}
             </article>)}</div>
             {billableCallId !== '' && <div className="tdai-form-grid">
-              <p className="tdai-muted">选中 {billableCallId}；人工审计只追加记录，不会释放预算预留或重发请求。</p>
+              <p className="tdai-muted">选中 {billableCallId}；人工审计只追加记录，不会解除未知调用占用或重发请求。</p>
               <label className="tdai-field"><span>审计结论</span><select value={attemptDisposition} onChange={(event) => setAttemptDisposition(event.currentTarget.value as typeof attemptDisposition)}><option value="retain_unknown">保留未知</option><option value="charged">标记已计费</option></select></label>
               <label className="tdai-field"><span>审计理由（至少 8 字）</span><input value={attemptReason} onChange={(event) => setAttemptReason(event.currentTarget.value)} /></label>
               <button type="button" disabled={manageBusy || attemptReason.trim().length < 8} onClick={() => manageAction('billable.reviewUnknown', { callId: billableCallId, disposition: attemptDisposition, reason: attemptReason }, '未知调用审计已记录')}>记录调用审计</button>
@@ -3215,12 +3189,12 @@ function Loaded(props: DashboardActions & { initialSnapshot?: DashboardSnapshot 
             <p className="tdai-muted">输入 {item.inputTokens === null ? '未知' : item.inputTokens} · 输出 {item.outputTokens === null ? '未知' : item.outputTokens}</p>
           </article>)}{overviewData.usage.byModel.length === 0 && <p className="tdai-muted">所选期间没有已记录的插件辅助抽取尝试。</p>}</div>}
         </section>
-        <section className="tdai-panel"><div className="tdai-panel-head"><h3>插件辅助调用 · 按调用阶段</h3><span>预算账本已记录实际 Token</span></div>
+        <section className="tdai-panel"><div className="tdai-panel-head"><h3>插件辅助调用 · 按调用阶段</h3><span>用量账本已记录实际 Token</span></div>
           <p className="tdai-muted">仅覆盖本插件账本内的辅助调用；准备注入量是估算，未被计作实际调用回执。</p>
           {overviewData === undefined ? <p className="tdai-muted" role="status">{overviewStateText(selectedProjectKey, overviewLoading, overviewError)}</p> : <div className="tdai-list">{overviewData.usage.byPurpose.map((item) => <article className="tdai-memory" key={item.other ? 'other-purposes' : item.purpose}>
             <div className="tdai-memory-top"><code>{item.other ? '其他阶段（合并）' : item.purpose}</code><span>{item.calls} 次 · 未知 {item.unknownCalls}</span></div>
             <p className="tdai-muted">{item.tokens === null ? 'Token 用量未知' : `${item.tokens} tokens`}</p>
-          </article>)}{overviewData.usage.byPurpose.length === 0 && <p className="tdai-muted">所选期间没有已记录的插件预算账本调用。</p>}</div>}
+          </article>)}{overviewData.usage.byPurpose.length === 0 && <p className="tdai-muted">所选期间没有已记录的插件辅助调用。</p>}</div>}
         </section>
       </div>
 
@@ -4284,10 +4258,6 @@ button.tdai-heat-cell { cursor: pointer; }
 .tdai-field textarea { flex: 1; max-width: 72%; min-height: 56px; padding: 7px; resize: vertical; border: 1px solid var(--tdai-control-border); border-radius: 5px; color: var(--tdai-ink); background: var(--tdai-control); font: inherit; font-size: 11px; }
 .tdai-form-grid > button { justify-self: start; padding: 6px 10px; border: 1px solid var(--tdai-control-border); border-radius: 5px; color: var(--tdai-ink); background: var(--tdai-button); font: inherit; font-size: 10px; cursor: pointer; }
 .tdai-form-grid > button:disabled { opacity: .5; }
-.tdai-budget-row { display: flex; align-items: center; gap: 12px; padding: 7px 0; border-top: 1px solid var(--tdai-line); color: var(--tdai-muted); font-size: 10px; }
-.tdai-budget-row strong { min-width: 110px; color: var(--tdai-ink); }
-.tdai-budget-row label { display: flex; align-items: center; gap: 5px; }
-.tdai-budget-row input { width: 96px; padding: 5px; border: 1px solid var(--tdai-control-border); border-radius: 5px; color: var(--tdai-ink); background: var(--tdai-control); font: inherit; }
 .tdai-result { border-top: 1px solid var(--tdai-line); padding-top: 8px; color: var(--tdai-muted); font-size: 10px; }
 .tdai-result pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--tdai-ink); }
 .tdai-detail-block { margin-top: 10px; padding: 10px; border-left: 2px solid var(--tdai-accent); background: var(--tdai-control); overflow-wrap: anywhere; }
@@ -4343,8 +4313,6 @@ ${LIGHT_THEME_CSS.replaceAll('.tdai-root', '.tdai-root:not([data-tdai-theme])')}
   .tdai-toolbar, .tdai-range-controls { align-items: stretch; flex-direction: column; }
   .tdai-range-controls > span { margin-left: 0; }
   .tdai-day-row { grid-template-columns: 72px minmax(24px, 1fr) 28px 56px; gap: 5px; font-size: 9px; }
-  .tdai-budget-row { align-items: flex-start; flex-wrap: wrap; }
-  .tdai-budget-row strong { width: 100%; }
   .tdai-field textarea { max-width: 100%; }
   .tdai-form-grid .tdai-field { align-items: stretch; flex-direction: column; }
   .tdai-form-grid .tdai-field input, .tdai-form-grid .tdai-field select, .tdai-form-grid .tdai-field textarea { max-width: 100%; width: 100%; }
@@ -4371,6 +4339,7 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
   const [revision, setRevision] = useState(0), [page, setPage] = useState(0)
   const [day, setDay] = useState<{ cell: MemoryDay; index: number } | undefined>()
   const [settingsFailed, setSettingsFailed] = useState(false)
+  const loadedScope = useRef<{ filter: string; transport: DashboardActions['readDashboard'] } | undefined>()
   const settingsMutation = useRef<ReturnType<typeof createMemorySettingsMutation> | undefined>()
   const savingNow = useRef(false)
   const [theme, setTheme] = useState<'light' | 'dark' | undefined>()
@@ -4379,6 +4348,7 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
   const year = new Date().getFullYear()
   const scanFilter = JSON.stringify([view, layer, search, scene, revision, year, zone])
+  const contentFilter = JSON.stringify([view, layer, search, scene, year, zone])
   useLayoutEffect(() => {
     if (root.current === null) return
     return observeDashboardTheme(root.current, setTheme)
@@ -4387,23 +4357,26 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
   useEffect(() => {
     const controller = createMemorySettingsMutation({ readDashboard: props.readDashboard, updateSettingsAck: props.updateSettingsAck })
     settingsMutation.current = controller; savingNow.current = false; setSaving(false); setSettingsFailed(false)
+    setSwitches(undefined)
     return () => { controller.dispose(); settingsMutation.current = undefined; mutation.current += 1; savingNow.current = false }
   }, [props.readDashboard, props.updateSettingsAck])
   useEffect(() => { const timer = setTimeout(() => { setSearch(query); setPage(0) }, 200); return () => clearTimeout(timer) }, [query])
   useEffect(() => {
     let cancelled = false
     const readMutation = mutation.current
-    setLoading(true); setError(''); setData(undefined); setDetail(undefined); setDay(undefined); setPage(0)
+    setLoading(true); setError(''); setDetail(undefined); setDay(undefined); setPage(0)
+    // Retain the same view during refresh; a different scope/transport never displays old records.
+    if (loadedScope.current?.filter !== contentFilter || loadedScope.current?.transport !== props.readDashboard) setData(undefined)
     void readGlobalMemory(props.readDashboard, { version: 1, action: 'global', layer: view === 'home' ? 'home' : layer,
       query: view === 'home' ? '' : search, year, timeZone: zone, ...(scan?.filter === scanFilter ? { resume: scan.token } : {}), ...(view === 'library' && scene ? { scene } : {}) }, () => cancelled)
       .then((result) => {
         if (cancelled || readMutation !== mutation.current || !result?.global) return
-        setData(result.global)
+        setData(result.global); loadedScope.current = { filter: contentFilter, transport: props.readDashboard }
         if (!savingNow.current && !settingsMutation.current?.hasFailed()) setSwitches({ generateMemory: result.global.generateMemory, useMemory: result.global.useMemory })
         setComplete(result.complete); setLoading(false)
       }).catch(() => { if (!cancelled && readMutation === mutation.current) { setData(undefined); setLoading(false); setError('读取未完成，请重试。') } })
     return () => { cancelled = true }
-  }, [props.readDashboard, props.updateSettingsAck, view, layer, search, scene, revision, year, zone, scan, scanFilter])
+  }, [props.readDashboard, props.updateSettingsAck, view, layer, search, scene, revision, year, zone, scan, scanFilter, contentFilter])
   useEffect(() => {
     let cancelled = false
     setRelated(undefined); setRelatedError('')
@@ -4427,15 +4400,16 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
   }
   const saveSwitch = async (key?: 'generateMemory' | 'useMemory'): Promise<void> => {
     const controller = settingsMutation.current
-    if (!controller || savingNow.current || key !== undefined && (!switches || controller.hasFailed())) return
+    if (!controller || savingNow.current || key !== undefined && (loading || !switches || controller.hasFailed())) return
     const token = ++mutation.current
     savingNow.current = true; setSaving(true); setError('')
     try {
-      const outcome = await (key === undefined ? controller.retry() : controller.save(key === 'generateMemory'
-        ? { generateMemory: !switches!.generateMemory } : { useMemory: !switches!.useMemory }))
+      const outcome = await (key === undefined ? controller.retry() : controller.save(
+        key === 'generateMemory' ? { generateMemory: !switches!.generateMemory } : { useMemory: !switches!.useMemory }))
       if (!mounted.current || token !== mutation.current || controller !== settingsMutation.current) return
       if (outcome.kind === 'saved') {
-        setSwitches(outcome.settings); setData((old) => old ? { ...old, ...outcome.settings } : old)
+        setSwitches(outcome.settings)
+        setData((old) => old ? { ...old, generateMemory: outcome.settings.generateMemory, useMemory: outcome.settings.useMemory } : old)
       }
       setSettingsFailed(controller.hasFailed())
     } finally {
@@ -4461,12 +4435,15 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
   const dateText = (at?: number): string => validDate(at)?.toLocaleString() ?? '时间不可用'
   const title = (item: GlobalMemoryItem): string => item.layer === 'L2' ? item.scene ?? item.id : item.content.trim().split('\n')[0]?.slice(0, 90) || '无正文'
   const layerNames = { L0: '原始对话', L1: '提炼记忆', L2: '场景索引', L3: '画像' }
+  const pauseLabels = { generation_disabled: '自动生成已关闭', capture_disabled: '对话采集已关闭',
+    extraction_disabled: '提炼已关闭' }
+  const pauseText = data?.pauseReasons?.map((reason) => pauseLabels[reason]).join('；')
   const calendar = memoryYear(year, zone, data?.days ?? [], data?.activityComplete ?? false)
   const dayTip = day && memoryDayPresentation(day.cell, day.index, calendar.firstWeekday, calendar.weeks)
   const rows = (items: GlobalMemoryItem[]): ReactNode => <div className="mv7-rows">{items.map((item) =>
     <div key={`${item.layer}:${item.key}`}>
     <button type="button" data-memory-key={item.key} className="mv7-row" aria-expanded={item.layer === 'L2' ? expanded === item.key : undefined}
-      onClick={() => item.layer === 'L2' ? setExpanded((old) => old === item.key ? undefined : item.key) : open(item)}>
+      disabled={loading} onClick={() => item.layer === 'L2' ? setExpanded((old) => old === item.key ? undefined : item.key) : open(item)}>
       <span className="mv7-row-icon" aria-hidden="true">{item.layer === 'L0' ? '◌' : item.layer === 'L2' ? '▱' : '◇'}</span>
       <span className="mv7-row-text"><strong>{title(item)}</strong><small>{item.content.replace(/\s+/g, ' ').slice(0, 160)}</small></span>
       <time dateTime={validDate(item.updatedAt)?.toISOString()}>{validDate(item.updatedAt)?.toLocaleDateString() ?? '时间不可用'}</time><span aria-hidden="true">›</span>
@@ -4479,7 +4456,7 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
       if (event.key !== 'Escape') return
       event.preventDefault(); setConfirm(false); setDay(undefined); setExpanded(undefined)
       if (detail) setDetail(undefined); else if (query) { setQuery(''); setSearch('') } else setSettings(false)
-    }} data-tdai-theme={theme} tabIndex={-1} aria-label="全局记忆">
+    }} data-tdai-theme={theme} tabIndex={-1} aria-label="全局记忆" aria-busy={loading}>
     <style>{MEMORY_V7_CSS}</style>
     {detail ? <>
       <button type="button" className="mv7-back" onClick={() => { setDetail(undefined); setConfirm(false) }}>‹ 返回{view === 'home' ? '首页' : '记忆库'}</button>
@@ -4498,16 +4475,19 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
       <header className="mv7-header"><h2>全局记忆</h2><button type="button" aria-label="记忆设置" aria-expanded={settings} onClick={() => setSettings((old) => !old)}>⚙</button></header>
       {settings && <div className="mv7-settings">
         {(['generateMemory', 'useMemory'] as const).map((key) => <label key={key}><span>{key === 'generateMemory' ? '自动生成记忆' : '在对话中使用记忆'}</span>
-          <button type="button" role="switch" aria-checked={switches?.[key] ?? false} aria-label={key === 'generateMemory' ? '自动生成记忆' : '在对话中使用记忆'} disabled={!data || saving || settingsFailed} onClick={() => void saveSwitch(key)}><span /></button></label>)}
+          <button type="button" role="switch" aria-checked={switches?.[key] ?? false} aria-label={key === 'generateMemory' ? '自动生成记忆' : '在对话中使用记忆'} disabled={!data || loading || saving || settingsFailed} onClick={() => void saveSwitch(key)}><span /></button></label>)}
+        <p className="mv7-muted">不设插件每日配额；按相关性召回，提炼调用仍记录实际用量。</p>
       </div>}
-      <div className="mv7-status"><span>{loading ? '正在读取…' : !data ? '状态不可用' : !data.generateMemory ? '自动记忆已关闭' : data.paused ? '自动记忆已暂停' : '自动记忆已开启'}</span><button type="button" onClick={() => library('L1')}>查看全部 ›</button></div>
+      <div className="mv7-status"><span>{loading ? '正在读取…' : !data ? '状态不可用' : !data.generateMemory ? '自动记忆已关闭' : data.paused ? '自动记忆已暂停' : '自动记忆已启用'}</span><button type="button" onClick={() => library('L1')}>查看全部 ›</button></div>
+      {pauseText && <p className="mv7-pause" role="status">{pauseText} <button type="button" onClick={() => setSettings(true)}>查看设置</button></p>}
       <div className="mv7-stats">{(['L0', 'L1', 'L2', 'L3'] as const).map((key) => <button type="button" key={key} onClick={() => library(key)}><span>{key} {layerNames[key]}</span><strong>{memoryMetric(data?.counts[key])}<small>{key === 'L2' ? '组' : key === 'L3' ? '份' : '条'}</small></strong></button>)}</div>
       <div className="mv7-activity"><div className="mv7-header"><h3>记忆活动</h3><span className="mv7-muted">{year} 年</span></div>
         <div className="mv7-heatmap-stage">
           {dayTip && <div className="mv7-tooltip" role="tooltip" data-edge={dayTip.edge} style={{ left: `${dayTip.x}%` }}>{dayTip.text}</div>}
           <div className="mv7-calendar" style={{ gridTemplateColumns: `repeat(${calendar.weeks}, minmax(0, 1fr))` }} role="group" aria-label="全年新增与更新的记忆记录">
-            {Array.from({ length: calendar.firstWeekday }, (_, index) => <span key={`pad-${index}`} />)}
-            {calendar.cells.map((cell, index) => {
+            {calendar.grid.map((cell, slot) => {
+              if (cell === null) return <span key={`pad-${slot}`} aria-hidden="true" data-padding="true" />
+              const index = slot - calendar.firstWeekday
               const presentation = memoryDayPresentation(cell, index, calendar.firstWeekday, calendar.weeks)
               return <button key={cell.date} type="button" disabled={cell.future} data-day={cell.date}
                 data-level={presentation.level} data-unknown={!cell.known} aria-label={presentation.text}
@@ -4518,7 +4498,7 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
             })}
           </div>
         </div>
-        <div className="mv7-months" aria-hidden="true">{Array.from({ length: 12 }, (_, index) => <span key={index}>{index + 1}月</span>)}</div>
+        <div className="mv7-months" style={{ gridTemplateColumns: `repeat(${calendar.weeks}, minmax(0, 1fr))` }} aria-hidden="true">{calendar.months.map((month) => <span key={month.month} style={{ gridColumn: `${month.column} / span ${month.span}` }}>{month.month}月</span>)}</div>
         <p className="mv7-muted">近 30 天新增 {memoryMetric(data?.recentAdded)} 条</p>
       </div>
       <details className="mv7-recent"><summary>最近活动</summary>{data?.items.length ? rows(data.items) : <p className="mv7-muted">{loading ? '正在读取…' : complete ? '暂无记忆活动' : '尚无可确认的活动'}</p>}</details>
@@ -4529,31 +4509,33 @@ function MemoryV7(props: DashboardProps & Required<Pick<DashboardActions, 'readD
       <div className="mv7-search-wrap"><input className="mv7-search" aria-label="搜索记忆" type="search" placeholder="搜索记忆…" maxLength={200} value={query} onChange={(event) => setQuery(event.target.value)} />{query && <button type="button" aria-label="清除搜索" onClick={() => { setQuery(''); setSearch(''); root.current?.querySelector<HTMLInputElement>('.mv7-search')?.focus() }}>×</button>}</div>
       {scene && <p className="mv7-muted">场景：{scene.name} <button type="button" onClick={() => setScene(undefined)}>查看全部</button></p>}
       <p className="mv7-muted">{memoryMetric(data?.counts[layer])} {layerNames[layer]}</p>
-      {loading ? <p role="status">正在读取…</p> : data?.items.length ? rows(data.items.slice(page * 12, page * 12 + 12)) : !error && <p>{search ? complete ? '没有匹配结果' : '已读取部分没有匹配结果' : complete ? '暂无记录' : '尚无可确认的记录'}</p>}
+      {loading && <p className="mv7-loading" role="status">正在读取…</p>}
+      {data?.items.length ? rows(data.items.slice(page * 12, page * 12 + 12)) : !loading && !error && <p>{search ? complete ? '没有匹配结果' : '已读取部分没有匹配结果' : complete ? '暂无记录' : '尚无可确认的记录'}</p>}
       {data && data.items.length > 12 && <nav className="mv7-pagination" aria-label="列表分页"><button type="button" disabled={page === 0} onClick={() => setPage((old) => old - 1)}>上一页</button><span>{page + 1} / {Math.ceil(data.items.length / 12)}</span><button type="button" disabled={(page + 1) * 12 >= data.items.length} onClick={() => setPage((old) => old + 1)}>下一页</button></nav>}
     </>}
-    {!loading && data && !complete && !detail && <p className="mv7-muted" role="status">当前为部分结果；来源、可读性或总预算尚不足以证明完整范围。</p>}
+    {!loading && data && !complete && !detail && <p className="mv7-muted" role="status">当前为部分结果；来源、可读性或本批读取范围尚不足以证明全部结果。</p>}
     {!loading && data?.next && !detail && <button type="button" onClick={() => setScan({ filter: scanFilter, token: data.next! })}>继续读取下一批</button>}
-    {settingsFailed && <div className="mv7-error" role="alert">设置尚未确认保存，当前开关保持原值。<button type="button" disabled={saving} onClick={() => void saveSwitch()}>重试保存</button></div>}
+    {settingsFailed && <div className="mv7-error" role="alert">设置尚未确认保存，当前设置保持已确认值。<button type="button" disabled={saving} onClick={() => void saveSwitch()}>重试保存</button></div>}
     {error && <div className="mv7-error" role="alert">{error} <button type="button" disabled={saving} onClick={() => setRevision((old) => old + 1)}>重新读取</button></div>}
   </section>
 }
 
 const MEMORY_V7_CSS = `
-.mv7{container-type:inline-size;container-name:memory-v7;--mv-bg:#222323;--mv-panel:#2a2b2d;--mv-text:#f0f1f2;--mv-muted:#a2a6ae;--mv-line:#3c3e41;--mv-accent:#8b9ffd;--mv-cell:#303236;color:var(--mv-text);background:var(--mv-bg);width:100%;max-width:none;min-width:0;box-sizing:border-box;padding:20px 22px;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;line-height:1.55;font:inherit;color-scheme:dark;}
+.mv7{container-type:inline-size;container-name:memory-v7;--mv-bg:#222323;--mv-panel:#2a2b2d;--mv-text:#f0f1f2;--mv-muted:#a2a6ae;--mv-line:#3c3e41;--mv-accent:#8b9ffd;--mv-cell:#303236;color:var(--mv-text);background:var(--mv-bg);height:clamp(360px,calc(100dvh - 180px),760px);width:100%;max-width:none;min-width:0;box-sizing:border-box;padding:20px 22px;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;line-height:1.55;font:inherit;color-scheme:dark;}
 .mv7[data-tdai-theme="light"]{--mv-bg:#fff;--mv-panel:#f3f4f6;--mv-text:#20242a;--mv-muted:#626b78;--mv-line:#e1e4e8;--mv-accent:#5265d0;--mv-cell:#f3f4f5;color-scheme:light;}
 @media(prefers-color-scheme:light){.mv7:not([data-tdai-theme]){--mv-bg:#fff;--mv-panel:#f3f4f6;--mv-text:#20242a;--mv-muted:#626b78;--mv-line:#e1e4e8;--mv-accent:#5265d0;--mv-cell:#f3f4f5;color-scheme:light;}}
-.mv7 *{box-sizing:border-box;min-width:0}.mv7 h2{font-size:20px;font-weight:500;margin:0 0 10px;overflow-wrap:anywhere}.mv7 h3{font-size:14px;font-weight:500;margin:0}.mv7 button{font:inherit;color:inherit;background:transparent;border:0;border-radius:5px;cursor:pointer;padding:6px 8px}.mv7 button:disabled{cursor:default;opacity:.45}.mv7 :focus-visible{outline:2px solid var(--mv-accent);outline-offset:3px}.mv7-header,.mv7-status{display:flex;align-items:center;justify-content:space-between;gap:12px}.mv7-header{margin-bottom:16px}.mv7-header h2{margin:0}.mv7-muted,.mv7-status{color:var(--mv-muted);font-size:12px}.mv7-status{margin:24px 0 20px}.mv7-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:24px}.mv7-stats>button{text-align:left;border-radius:0;padding:0 14px;border-right:1px solid var(--mv-line)}.mv7-stats>button:first-child{padding-left:0}.mv7-stats>button:last-child{border:0}.mv7-stats span{font-size:11px;color:var(--mv-muted);display:block;white-space:nowrap}.mv7-stats strong{font-size:28px;font-weight:400;display:block;margin-top:8px;font-variant-numeric:tabular-nums}.mv7-stats small{font-size:10px;margin-left:3px}.mv7-activity{padding:20px 0;border-top:1px solid var(--mv-line)}.mv7-heatmap-stage{position:relative;margin-top:28px}.mv7-calendar{display:grid;grid-template-rows:repeat(7,minmax(0,1fr));grid-auto-flow:column;gap:3px;width:100%}.mv7-calendar button,.mv7-calendar>span{aspect-ratio:1;padding:0;border-radius:2px;min-height:0;min-width:0;width:100%;background:var(--dsw-alias-bg-skeleton,var(--mv-cell))}.mv7-calendar>span{visibility:hidden}
+.mv7 *{box-sizing:border-box;min-width:0}.mv7 h2{font-size:20px;font-weight:500;margin:0 0 10px;overflow-wrap:anywhere}.mv7 h3{font-size:14px;font-weight:500;margin:0}.mv7 button{font:inherit;color:inherit;background:transparent;border:0;border-radius:5px;cursor:pointer;padding:6px 8px}.mv7 button:disabled{cursor:default;opacity:.45}.mv7 :focus-visible{outline:2px solid var(--mv-accent);outline-offset:3px}.mv7-header,.mv7-status{display:flex;align-items:center;justify-content:space-between;gap:12px}.mv7-header{margin-bottom:16px}.mv7-header h2{margin:0}.mv7-muted,.mv7-status{color:var(--mv-muted);font-size:12px}.mv7-status{margin:24px 0 20px}.mv7-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:24px}.mv7-stats>button{text-align:left;border-radius:0;padding:0 14px;border-right:1px solid var(--mv-line)}.mv7-stats>button:first-child{padding-left:0}.mv7-stats>button:last-child{border:0}.mv7-stats span{font-size:11px;color:var(--mv-muted);display:block;white-space:nowrap}.mv7-stats strong{font-size:28px;font-weight:400;display:block;margin-top:8px;font-variant-numeric:tabular-nums}.mv7-stats small{font-size:10px;margin-left:3px}.mv7-activity{padding:20px 0;border-top:1px solid var(--mv-line)}.mv7-heatmap-stage{position:relative;margin-top:28px}.mv7-calendar{display:grid;grid-template-rows:repeat(7,minmax(0,1fr));grid-auto-flow:column;gap:3px;width:100%}.mv7-calendar button,.mv7-calendar>span{aspect-ratio:1;padding:0;border-radius:2px;min-height:0;min-width:0;width:100%;background:var(--dsw-alias-bg-skeleton,var(--mv-cell))}.mv7-calendar>span{background:var(--mv-cell);opacity:.65}
 .mv7-calendar{--mv-particle:var(--dsw-alias-state-business-primary,#0f766e)}
 .mv7-calendar button[data-level="1"]{background:color-mix(in srgb,var(--mv-particle) 20%,var(--mv-bg));background:oklch(from var(--mv-particle) .89 calc(c * .35) h)}
 .mv7-calendar button[data-level="2"]{background:color-mix(in srgb,var(--mv-particle) 40%,var(--mv-bg));background:oklch(from var(--mv-particle) .78 calc(c * .55) h)}
 .mv7-calendar button[data-level="3"]{background:color-mix(in srgb,var(--mv-particle) 60%,var(--mv-bg));background:oklch(from var(--mv-particle) .67 calc(c * .75) h)}
 .mv7-calendar button[data-level="4"]{background:color-mix(in srgb,var(--mv-particle) 80%,var(--mv-bg));background:oklch(from var(--mv-particle) .56 calc(c * .9) h)}
 .mv7-calendar button[data-level="5"]{background:var(--mv-particle);background:oklch(from var(--mv-particle) .45 c h)}
-.mv7-calendar button[data-unknown="true"][data-level="0"]{background:transparent;box-shadow:inset 0 0 0 1px var(--mv-line)}
-.mv7-months{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px;color:var(--mv-muted);font-size:9px;line-height:14px;margin-top:7px}.mv7-months span{overflow:hidden;white-space:nowrap}
-.mv7-tooltip{position:absolute;z-index:2;bottom:calc(100% + 6px);left:50%!important;width:max-content;max-width:calc(100% - 8px);transform:translateX(-50%);border-radius:8px;padding:5px 9px;background:var(--dsw-alias-bg-layer-3,var(--mv-panel));box-shadow:var(--dsw-shadow-lv1,0 2px 8px #0002);color:var(--mv-text);font-size:11px;line-height:18px;pointer-events:none;white-space:normal;overflow-wrap:anywhere}
+.mv7-calendar button[data-unknown="true"][data-level="0"]{background:repeating-linear-gradient(135deg,var(--mv-cell),var(--mv-cell) 2px,var(--mv-line) 2px,var(--mv-line) 3px);box-shadow:inset 0 0 0 1px var(--mv-line)}
+.mv7-months{display:grid;gap:3px;color:var(--mv-muted);font-size:9px;line-height:14px;margin-top:7px}.mv7-months span{overflow:hidden;white-space:nowrap}
+.mv7-tooltip{position:absolute;z-index:2;bottom:calc(100% + 6px);left:50%!important;width:calc(100% - 8px);max-width:480px;min-height:46px;transform:translateX(-50%);border-radius:8px;padding:5px 9px;background:var(--dsw-alias-bg-layer-3,var(--mv-panel));box-shadow:var(--dsw-shadow-lv1,0 2px 8px #0002);color:var(--mv-text);font-size:11px;line-height:18px;pointer-events:none;white-space:normal;overflow-wrap:anywhere}
 .mv7-inline{padding:4px 12px 12px;background:var(--mv-panel);font-size:12px}.mv7-search-wrap{position:relative}.mv7-search-wrap input{padding-right:38px}.mv7-search-wrap>button{position:absolute;right:4px;top:2px}.mv7-recent,.mv7-sources{padding-top:18px;border-top:1px solid var(--mv-line)}.mv7 summary{cursor:pointer;font-size:13px;color:var(--mv-muted);padding:5px 0}.mv7-settings{border-block:1px solid var(--mv-line);padding:10px 0}.mv7-settings label{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;font-size:14px}.mv7 [role="switch"]{padding:3px;width:36px;height:21px;background:var(--mv-line);border-radius:15px;flex:none}.mv7 [role="switch"]>span{display:block;width:15px;height:15px;background:var(--mv-muted);border-radius:50%}.mv7 [role="switch"][aria-checked="true"]{background:var(--mv-text)}.mv7 [role="switch"][aria-checked="true"]>span{margin-left:15px;background:var(--mv-bg)}.mv7-back{font-size:12px!important;padding-left:0!important;margin-bottom:14px;color:var(--mv-muted)!important}.mv7-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px;background:var(--mv-panel);padding:3px;border-radius:8px;margin-bottom:12px}.mv7-tabs button{font-size:12px;height:34px;padding:5px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mv7-tabs [aria-selected="true"]{background:var(--mv-line)}.mv7-search{display:block;width:100%;background:var(--mv-panel);border:1px solid transparent;border-radius:7px;padding:9px 12px;color:var(--mv-text);font:inherit;font-size:13px}.mv7-row{display:flex!important;align-items:center;gap:10px;width:100%;text-align:left;border-radius:0!important;border-top:1px solid var(--mv-line)!important;padding:13px 0!important}.mv7-row-icon{padding:4px 7px;background:var(--mv-panel);border-radius:7px;flex:none}.mv7-row-text{flex:1;overflow:hidden}.mv7-row strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400;font-size:13px}.mv7-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--mv-muted);margin-top:3px}.mv7-row time{font-size:10px;color:var(--mv-muted);flex:none}.mv7-body{white-space:pre-wrap;overflow-wrap:anywhere;border-radius:10px;background:var(--mv-panel);padding:20px;margin:24px 0;font-size:14px}.mv7-sources{margin:24px 0;font-size:12px;overflow-wrap:anywhere}.mv7-forget{color:#d98888!important}.mv7-confirm{background:var(--mv-panel);border-radius:8px;padding:12px;font-size:13px}.mv7-error{color:#db8585;font-size:13px;padding-top:16px}.mv7-pagination{display:flex;align-items:center;justify-content:center;gap:16px;font-size:12px;padding:12px 0}
+.mv7-pause{font-size:12px;color:var(--mv-muted);padding:10px 12px;background:var(--mv-panel);border-radius:8px;margin:-8px 0 20px;overflow-wrap:anywhere}.mv7-pause button{font-size:12px;color:var(--mv-accent)}.mv7-loading{min-height:120px;border-radius:8px;background:var(--mv-panel);padding:20px;color:var(--mv-muted);font-size:13px}.mv7-calendar button:disabled[data-level="0"]{opacity:1;background:var(--mv-cell)}
 @container memory-v7 (max-width:320px){.mv7-tabs button{font-size:10px}}
-@media(max-width:480px){.mv7{padding:16px 10px}.mv7-stats>button{padding:0 7px}.mv7-stats span{font-size:9px}.mv7-stats strong{font-size:22px}.mv7-tabs button{font-size:10px}.mv7-calendar{gap:2px}.mv7-months{font-size:8px}.mv7-row time{display:none}.mv7-body{padding:14px}}
+@media(max-width:480px){.mv7{padding:16px 10px}.mv7-stats>button{padding:0 7px}.mv7-stats span{font-size:9px}.mv7-stats strong{font-size:22px}.mv7-tabs button{font-size:10px}.mv7-calendar{gap:2px}.mv7-months{font-size:8px;gap:2px}.mv7-row time{display:none}.mv7-body{padding:14px}}
 `

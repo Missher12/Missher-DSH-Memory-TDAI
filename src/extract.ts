@@ -83,18 +83,20 @@ export interface ConversationEntry {
 
 const VALID_KINDS = new Set(['fact', 'preference', 'decision', 'project', 'next'])
 
-export function routeFromHost(ctx: HostContextLike, session: SessionLike | undefined, config: ResolvedConfig): Route | undefined {
+export function routeFromHost(ctx: HostContextLike, session: SessionLike | undefined, config: ResolvedConfig, committed?: { provider?: unknown; model?: unknown }): Route | undefined {
   // A provider default can change between capture and dispatch. Only an
   // explicit plugin route or the session's committed request route is safe to
   // freeze into a durable extraction job.
   void ctx
-  if (config.extraction.provider && config.extraction.model) {
+  if (committed === undefined && config.extraction.provider && config.extraction.model) {
     return { provider: config.extraction.provider, model: config.extraction.model }
   }
   try {
     const headerRoute = session?.requestHeader?.()?.config
-    if (headerRoute?.provider && headerRoute?.model) {
-      return { provider: headerRoute.provider, model: headerRoute.model }
+    if (typeof committed?.provider === 'string' && committed.provider.trim() &&
+        typeof committed.model === 'string' && committed.model.trim() &&
+        headerRoute?.provider === committed.provider && headerRoute.model === committed.model) {
+      return { provider: committed.provider, model: committed.model }
     }
   } catch {
     // A session without a committed request header is normal before the first call.
