@@ -9,7 +9,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { lstatSync, realpathSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { isValidProjectKey, MAX_PROJECT_KEY_LENGTH } from './project-key.js'
@@ -100,9 +100,29 @@ export function resolveDshHome(configured?: string): string {
   return path.join(homedir(), '.dsh')
 }
 
-export function resolveMemoryRoot(dataDir: string | undefined, dshHome?: string): string {
+export function resolveMemoryRoot(dataDir: string | undefined, dshHome?: string, profileDirectory?: string): string {
   if (dataDir?.trim()) return path.resolve(dataDir)
-  return path.join(resolveDshHome(dshHome), 'memory-tdai')
+  const legacy = path.join(resolveDshHome(dshHome), 'memory-tdai')
+  if (profileDirectory === undefined) return legacy
+  if (!path.isAbsolute(profileDirectory)) throw new Error('Host profile directory must be absolute')
+  const profile = realpathSync(profileDirectory)
+  if (!lstatSync(profile).isDirectory()) throw new Error('Host profile directory is unavailable')
+  const scoped = path.join(profile, 'memory-tdai')
+  const legacyStat = lstatSync(legacy, { throwIfNoEntry: false })
+  if (legacyStat === undefined) return scoped
+  if (legacyStat.isSymbolicLink() || !legacyStat.isDirectory()) throw new Error('legacy memory profile root is not a regular directory')
+  const file = path.join(legacy, '.profile-owner.json'), stat = lstatSync(file, { throwIfNoEntry: false })
+  if (stat === undefined) return scoped
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 4096) throw new Error('legacy memory profile owner is invalid')
+  let owner: { version?: unknown; profileDir?: unknown }
+  try { owner = JSON.parse(readFileSync(file, 'utf8')) as typeof owner }
+  catch { throw new Error('legacy memory profile owner is invalid') }
+  if (owner === null || typeof owner !== 'object' || owner.version !== 1 ||
+      typeof owner.profileDir !== 'string' || !path.isAbsolute(owner.profileDir) || path.resolve(owner.profileDir) !== owner.profileDir) {
+    throw new Error('legacy memory profile owner is invalid')
+  }
+  // Never guess who owns an older shared root. Adoption is an explicit upgrade operation.
+  return owner.profileDir === profile ? legacy : scoped
 }
 
 export function projectIdentity(cwd: string): ProjectIdentity {

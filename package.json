@@ -1,6 +1,6 @@
 {
   "name": "@missher/dsh-memory-tdai",
-  "version": "0.1.1",
+  "version": "0.1.2-local.18",
   "private": true,
   "description": "Unofficial DSH native memory plugin derived from TencentDB Agent Memory (L0-L3)",
   "keywords": [

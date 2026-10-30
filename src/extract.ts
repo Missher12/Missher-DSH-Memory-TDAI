@@ -31,6 +31,16 @@ export interface ExtractedMemory {
 export interface Route {
   provider: string
   model: string
+  reasoningEffort?: string
+}
+
+/** Background JSON extraction must not inherit an interactive high-thinking default. */
+export async function prepareBackgroundRoute(llm: LlmLike, route: Route, signal?: AbortSignal): Promise<Route> {
+  if (llm.resolveModelInfo === undefined) return route
+  const info = await llm.resolveModelInfo(route.provider, route.model, signal)
+  const offered = new Set(info.reasoning?.efforts.map(effort => effort.id) ?? [])
+  const reasoningEffort = ['off', 'none', 'minimal', 'low'].find(effort => offered.has(effort))
+  return reasoningEffort === undefined ? route : { ...route, reasoningEffort }
 }
 
 export interface ObservedUsage {
@@ -54,13 +64,14 @@ export interface ExtractionStreamResult {
 }
 
 export function requestIdentityHash(route: Route, messages: Array<{ role: string; content: unknown }>, maxTokens: number): string {
-  return createHash('sha256').update(JSON.stringify({ provider: route.provider, model: route.model, maxTokens, messages })).digest('hex')
+  return createHash('sha256').update(JSON.stringify({ provider: route.provider, model: route.model,
+    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }), maxTokens, messages })).digest('hex')
 }
 
-export function extractionRequestIdentityHash(route: Route, conversation: string, maxMemories: number, existing: string[], maxTokens: number): string {
+export function extractionRequestIdentityHash(route: Route, conversation: string, maxMemories: number, existing: string[], maxTokens: number, priorPartial = false): string {
   const messages = [
     { role: 'system', content: [{ type: 'text', text: systemPromptFor(maxMemories) }] },
-    { role: 'user', content: [{ type: 'text', text: buildL1UserPrompt(conversation, maxMemories, existing) }] },
+    { role: 'user', content: [{ type: 'text', text: buildL1UserPrompt(conversation, maxMemories, existing, priorPartial) }] },
   ]
   return requestIdentityHash(route, messages, maxTokens)
 }
@@ -148,6 +159,7 @@ export function parseExtractionJson(text: string): ExtractionParseResult {
       ? (parsed as { memories: unknown[] }).memories
       : undefined
   if (list === undefined) return { ok: false, reason: 'invalid-shape' }
+  if (list.length > 50) return { ok: false, reason: 'invalid-items' }
   const output: ExtractedMemory[] = []
   // "Damaged" items are protocol garbage (not an object, or without a non-empty
   // string content). `{memories:[]}` stays legal; a non-empty array whose items
@@ -175,9 +187,10 @@ export function parseExtractionJson(text: string): ExtractionParseResult {
     const kindRaw = typeof record.kind === 'string' ? record.kind : 'fact'
     const kind = VALID_KINDS.has(kindRaw) ? kindRaw : 'fact'
     const scene = typeof record.scene === 'string' && record.scene.trim() !== '' ? record.scene.trim().slice(0, 120) : undefined
-    const sourceMessageIds = Array.isArray(record.source_message_ids)
-      ? record.source_message_ids.filter((value): value is string => typeof value === 'string').slice(0, 12)
-      : []
+    const rawSourceIds = record.source_message_ids
+    if (Array.isArray(rawSourceIds) && (rawSourceIds.length > 100 || rawSourceIds.some((id) =>
+      typeof id !== 'string' || id.length === 0 || Buffer.byteLength(id, 'utf8') > 256))) return { ok: false, reason: 'invalid-items' }
+    const sourceMessageIds = Array.isArray(rawSourceIds) ? [...new Set(rawSourceIds as string[])] : []
     let validFrom: number | string | null | undefined
     if (Object.prototype.hasOwnProperty.call(record, 'valid_from')) {
       const rawValidFrom = record.valid_from
@@ -188,7 +201,7 @@ export function parseExtractionJson(text: string): ExtractionParseResult {
     output.push({ content, kind, confidence, scene, sourceMessageIds, ...(typeof record.has_conflict === 'boolean' ? { hasConflict: record.has_conflict } : {}), ...(validFrom === undefined && !Object.prototype.hasOwnProperty.call(record, 'valid_from') ? {} : { validFrom }) })
   }
   if (list.length > 0 && damaged === list.length) return { ok: false, reason: 'invalid-items' }
-  return { ok: true, memories: output.slice(0, 50) }
+  return { ok: true, memories: output }
 }
 
 export async function requestExtraction(
@@ -199,8 +212,9 @@ export async function requestExtraction(
   existing: string[],
   maxTokens: number,
   signal?: AbortSignal,
+  priorPartial = false,
 ): Promise<string> {
-  const result = await requestExtractionDetailed(llm, route, conversation, maxMemories, existing, maxTokens, signal)
+  const result = await requestExtractionDetailed(llm, route, conversation, maxMemories, existing, maxTokens, signal, priorPartial)
   if (!result.ok) throw new ObservedStreamError(result.error ?? `incomplete extraction stream (${result.terminal})`, result.usage, result.terminal)
   return result.text
 }
@@ -213,10 +227,11 @@ export async function requestExtractionDetailed(
   existing: string[],
   maxTokens: number,
   signal?: AbortSignal,
+  priorPartial = false,
 ): Promise<ExtractionStreamResult> {
   const messages = [
     { role: 'system', content: [{ type: 'text', text: systemPromptFor(maxMemories) }] },
-    { role: 'user', content: [{ type: 'text', text: buildL1UserPrompt(conversation, maxMemories, existing) }] },
+    { role: 'user', content: [{ type: 'text', text: buildL1UserPrompt(conversation, maxMemories, existing, priorPartial) }] },
   ]
   return collectTextStream(llm, route, messages, maxTokens, signal)
 }
@@ -286,6 +301,7 @@ async function collectTextStream(
     for await (const chunk of llm.stream({
       provider: route.provider,
       model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
       messages,
       maxTokens,
       ...(signal === undefined ? {} : { signal }),

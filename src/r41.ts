@@ -4,6 +4,14 @@ import { estimateTokens } from './tokens.js'
 export type InputClass = 'structured' | 'correction' | 'conversation' | 'small_talk' | 'derived' | 'system' | 'unknown'
 export type QueryIntent = 'lookup' | 'history' | 'decision' | 'resume' | 'experience' | 'explore' | 'unknown'
 
+/** Only actual dialogue can become conversation evidence; an absent source supports minimal/legacy hosts. */
+export function isConversationSource(sourceKind?: string | null, role?: string): boolean {
+  if (role !== undefined && role !== 'user' && role !== 'assistant') return false
+  if (sourceKind == null || sourceKind === '' || sourceKind === 'conversation') return true
+  if (sourceKind === 'user' || sourceKind === 'user-question-reply') return role !== 'assistant'
+  return sourceKind === 'model' && role !== 'user'
+}
+
 export function normalizeExactQuestion(text: string): string {
   // Only whitespace and Unicode canonical composition are normalized. Negation,
   // numbers, dates, model names, punctuation and version strings stay intact.
@@ -12,7 +20,9 @@ export function normalizeExactQuestion(text: string): string {
 
 export function classifyInput(input: { role: string; text: string; sourceKind?: string; derivedFrom?: string[] }): { kind: InputClass; process: boolean; reason: string } {
   const sourceKind = input.sourceKind ?? ''
-  if (sourceKind === 'memory' || sourceKind === 'runtime-context' || (input.derivedFrom?.length ?? 0) > 0) {
+  if (sourceKind === 'memory' || sourceKind === 'runtime-context' ||
+      (input.role === 'user' || input.role === 'assistant') && !isConversationSource(sourceKind, input.role) ||
+      (input.derivedFrom?.length ?? 0) > 0) {
     return { kind: 'derived', process: false, reason: 'derived_or_injected_content' }
   }
   if (input.role !== 'user' && input.role !== 'assistant') return { kind: 'system', process: false, reason: 'unsupported_role' }

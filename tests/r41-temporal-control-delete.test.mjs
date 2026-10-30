@@ -433,7 +433,7 @@ test('R6 CR05 purges terminal extraction bodies and a global persona response th
     assert.equal(result.cleanupStatus, 'complete')
     const jobs = runtime.stores.get(project.key).db.prepare('SELECT id, status, input_snapshot, response_text FROM extraction_jobs WHERE id IN (?, ?)')
       .all(completed.id, failed.id)
-    assert.deepEqual(jobs.map((job) => job.status).sort(), ['completed', 'failed'])
+    assert.deepEqual(jobs.map((job) => job.status).sort(), ['completed', 'source_pruned'])
     assert.ok(jobs.every((job) => job.input_snapshot === '[]' && job.response_text === null))
     assert.ok(!runtime.billableResults.callIds().includes('bill-global-selected'))
   } finally {

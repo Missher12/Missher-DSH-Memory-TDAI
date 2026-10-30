@@ -2,11 +2,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, opendirSync, realpathSync, readFileSync, openSync, fstatSync, closeSync, constants, type Dir } from 'node:fs'
 import path from 'node:path'
-import { tokenize, type MemoryStore, type MemoryRecord } from './store.js'
+import { recallQueryTerms, recallTermMatches, type MemoryStore, type MemoryRecord } from './store.js'
 import { isValidProjectKey } from './project.js'
 import type { ResolvedConfig } from './config.js'
 import type { DashboardReadBinding, DashboardReadOutcome } from './dashboard-read.js'
-import { dashboardSceneMemberDigest, isValidDashboardSceneMember, type DashboardSceneMetaRow,
+import { isValidDashboardSceneMember, type DashboardSceneMetaRow,
   type DashboardSceneMemberRow, type DashboardVisibilityReadSession } from './dashboard-visibility.js'
 import { ReadDashboardRequestSchema, type ReadDashboardRequest, type ReadDashboardResult,
   type GlobalMemoryItem, type GlobalMemoryPage } from './remote-contract.js'
@@ -26,11 +26,10 @@ const hash = (value: string): string => createHash('sha256').update(value).diges
 // Base: bounded paths/filter, <=5 source keys/4 pins, counters, and the OS directory buffer.
 // Bodies never accumulate here. Home retains <=128KiB recent items +48KiB calendar +16KiB metadata.
 const BASE_STATE_BYTES = 64 * 1024
-const HOME_STATE_BYTES = 192 * 1024
-const PAGE_STATE_BYTES = 128 * 1024
-// Preserve the existing 100-member ceiling. Each scene reserves 4KiB +1KiB/member
-// and a separate 512 +288 bytes/member key lease; no summary body is retained.
-const SCENE_MEMBER_LIMIT = 100
+const HOME_STATE_BYTES = 256 * 1024
+const PAGE_STATE_BYTES = 256 * 1024
+// A derived index retains only one 15-member page and a constant-size proof.
+const DERIVED_STATE_BYTES = 32 * 1024
 // Search also owns the server-side accumulated candidate bodies until the final window proof.
 const SEARCH_STATE_BYTES = 256 * 1024
 const WIRE_BYTES = 128 * 1024
@@ -89,6 +88,22 @@ export function profileSources(root: string): { keys: string[]; complete: boolea
     marker: hash(`${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${identities.sort().join("|")}`) }
 }
 
+/** Metadata-only fence across budget windows; bodies and prior visibility proofs are never reused. */
+function scanSnapshot(root: string): { stamp: string; complete: boolean } {
+  const sources = profileSources(root), digest = createHash('sha256').update(sources.marker)
+  const files = ['control/control.db', 'control/control.db-wal', 'global/persona.json']
+  for (const key of sources.keys) files.push(`projects/${key}/memory.db`, `projects/${key}/memory.db-wal`)
+  for (const file of files) {
+    const stat = lstatSync(path.join(root, file), { bigint: true, throwIfNoEntry: false })
+    // SQLite may create an empty WAL while opening a read-only connection.
+    // No frames means no data change; actual commits alter WAL frames or the main DB.
+    const identity = file.endsWith('-wal') && (stat === undefined || stat.size <= 32n) ? 'no-frames' :
+      stat === undefined ? 'absent' : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+    digest.update(`${file}:${identity};`)
+  }
+  return { stamp: digest.digest('hex'), complete: sources.complete }
+}
+
 type Request = Extract<ReadDashboardRequest, { action: 'global' }>
 type Layer = GlobalMemoryItem['layer']
 type Options = { root(): string; policy(): string; config: ResolvedConfig;
@@ -98,27 +113,31 @@ type RelationRow = NonNullable<ReturnType<MemoryStore['globalRelationRow']>>
 type SearchNode = { projectKey: string; id: string; revision: number; depth: number; score: number; direction: 'from' | 'to'; after: number }
 type SearchState = { emitted: Map<string, 'profile_lexical' | 'relation'>; visited: Set<string>; queue: SearchNode[];
   pending?: { row: RelationRow; phase: number; evidenceIndex: number }; seeds: number; rows: number; relations: number; bodyBytes: number }
-const newSearch = (saved?: SearchState): SearchState => ({ emitted: new Map(), visited: new Set(saved?.visited),
-  queue: saved?.queue.map((node) => ({ ...node })) ?? [], seeds: 0, rows: 0, relations: 0, bodyBytes: 0 })
+const newSearch = (saved?: SearchState): SearchState => ({ emitted: new Map(saved?.emitted), visited: new Set(saved?.visited),
+  queue: saved?.queue.map((node) => ({ ...node })) ?? [], seeds: saved?.seeds ?? 0, rows: saved?.rows ?? 0, relations: saved?.relations ?? 0, bodyBytes: 0 })
 const searchKey = (projectKey: string, id: string): string => `${projectKey}\0${id}`
 type SceneProgress = {
   row: DashboardSceneMetaRow; name: string; hasMore: boolean; members: DashboardSceneMemberRow[];
-  nextMember: number; afterOrdinal?: number; memberHasMore: boolean; phase: 'members' | 'proof' | 'final'; restarted: boolean;
-  lease: string; keyLease: string;
+  nextMember: number; afterOrdinal?: number; memberHasMore: boolean; phase: 'members' | 'proof' | 'final'; proofToken: string;
+  lease: string;
 }
 type PersonaPlan = Parameters<DashboardVisibilityReadSession['readManagedPersonaBody']>[1]
-type PersonaProgress = { key: string; plan?: PersonaPlan; nextIndex: number; restarted: boolean; lease?: string; keyLease?: string }
+type PersonaProgress = { key: string; plan?: PersonaPlan; nextIndex: number; members: DashboardSceneMemberRow[]; afterOrdinal?: number; hasMore: boolean; lease?: string }
 type State = {
-  id: string; cursor?: string; bookmark?: string; reader: DashboardVisibilityReadSession; request: Request; root: string; marker: string; policy: string;
-  search?: SearchState; sourceDone: boolean; globalPersonaLease?: string; persona?: PersonaProgress; personaRestart?: string;
+  snapshot: string;
+  expiresAt?: number;
+  processing: { queued: number; failed: number; uncertain: number; pendingApproval: number; latestIssue?: string }; latestIssueAt: number;
+  id: string; cursor?: string; bookmark?: string; lastBatchPosition?: string; reader: DashboardVisibilityReadSession; request: Request; root: string; marker: string; policy: string;
+  search?: SearchState; sourceDone: boolean; globalPersonaLease?: string; persona?: PersonaProgress;
   filePins: Map<string, { dev: number; ino: number }>; directory?: DirectoryPosition; directoryDone: boolean; resumed: boolean;
   keys: string[]; index: number; stage: number; ordinal: number; memoryAfter?: { createdAt: number; id: string };
-  sceneAfter?: { memoryCount: number; name: string }; scene?: SceneProgress; sceneRestart?: string; counts: Record<Layer, number>; incomplete: boolean;
+  sceneAfter?: { memoryCount: number; name: string }; scene?: SceneProgress; counts: Record<Layer, number>; incomplete: boolean;
   days: Map<string, { date: string; added: number; updated: number; records: string[] }>;
   globalDone: boolean; globalLoaded: boolean; globalIndex: number; globalFile?: { file: string; identity: string }; globalPersona?: { content: string; updatedAt: number; sources: Array<{ projectKey: string; id: string; revision: number }> };
-  dayBytes: number; recentAdded: number; recent: GlobalMemoryItem[]; dayKeys: Set<string>; date: Intl.DateTimeFormat; now: number; rounds: number;
+  calendarAfter?: { id: string; revision: number }; calendarId?: string;
+  recentAdded: number; recent: GlobalMemoryItem[]; dayKeys: Set<string>; date: Intl.DateTimeFormat; now: number; rounds: number;
 }
-type Progress = Pick<State, 'root' | 'marker' | 'policy' | 'request' | 'directory' | 'directoryDone' | 'stage' | 'ordinal' | 'memoryAfter' | 'sceneAfter' | 'sourceDone' | 'sceneRestart' | 'personaRestart'> & { search?: SearchState; key?: string; pin?: { dev: number; ino: number } }
+type Progress = Pick<State, 'root' | 'marker' | 'policy' | 'request' | 'directory' | 'directoryDone' | 'stage' | 'ordinal' | 'memoryAfter' | 'sceneAfter' | 'sourceDone' | 'snapshot' | 'now' | 'counts' | 'incomplete' | 'days' | 'dayKeys' | 'recent' | 'recentAdded' | 'processing' | 'latestIssueAt' | 'expiresAt' | 'calendarAfter' | 'calendarId' | 'globalLoaded' | 'globalDone' | 'globalIndex' | 'globalFile' | 'globalPersona'> & { search?: SearchState; key?: string; pin?: { dev: number; ino: number }; active?: State }
 function directoryMarker(root: string): string {
   const directory = path.join(root, 'projects'), stat = lstatSync(directory, { throwIfNoEntry: false })
   if (stat === undefined) return 'absent'
@@ -191,12 +210,15 @@ export class GlobalMemoryReader {
   private readonly progress = new Map<string, Progress>()
   private readonly terminals = new Set<string>()
   constructor(private readonly options: Options) {}
-  owns(id: string): boolean { return this.states.has(id) || this.terminals.has(id) }
+  owns(id: string): boolean { return this.states.has(id) || this.terminals.has(id) || this.progress.has(id) }
   close(): void { for (const state of [...this.states.values()]) this.retire(state); for (const token of [...this.progress.keys()]) this.options.dropProgress(token) }
   private ended(id: string): void {
     const state = this.states.get(id)
     if (state) closeDirectory(state.directory)
     this.states.delete(id); this.terminals.add(id)
+    if (state?.bookmark !== undefined && this.progress.get(state.bookmark)?.active === state) {
+      this.options.dropProgress(state.bookmark)
+    }
     while (this.terminals.size > 128) this.terminals.delete(this.terminals.values().next().value!)
   }
   private retire(state: State): void { this.ended(state.id); state.reader.cancel() }
@@ -206,13 +228,15 @@ export class GlobalMemoryReader {
       const request = ReadDashboardRequestSchema.parse(input)
       if (request.action === 'global') {
         if (request.relationDepth !== undefined && request.layer !== 'L1') throw new Error('unavailable')
+        if (request.status !== undefined && (request.layer !== 'L1' || request.status === 'candidate' && request.relationDepth !== undefined)) throw new Error('unavailable')
         const root = realpathSync(this.options.root()), id = randomUUID(), marker = directoryMarker(root)
         if (Buffer.byteLength(root) > 4096) throw new Error('unavailable')
-        const policy = this.options.policy()
+        const policy = this.options.policy(), snapshot = scanSnapshot(root)
         const date = new Intl.DateTimeFormat('en-CA', { timeZone: request.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
         const { resume, ...filter } = request
         const saved = resume === undefined ? undefined : this.progress.get(resume)
-        if (resume !== undefined && (saved === undefined || saved.root !== root || saved.policy !== policy || saved.marker !== marker ||
+        if (resume !== undefined && (saved === undefined || saved.root !== root || saved.policy !== policy || saved.marker !== marker || saved.snapshot !== snapshot.stamp ||
+            saved.expiresAt !== undefined && saved.expiresAt <= Date.now() ||
             JSON.stringify(saved.request) !== JSON.stringify(filter) || !this.options.inspectProgress(resume))) {
           if (resume !== undefined) this.options.dropProgress(resume)
           throw new Error('stale')
@@ -223,12 +247,21 @@ export class GlobalMemoryReader {
             this.options.dropProgress(resume!); throw new Error('stale')
           }
         }
+        if (saved?.active !== undefined) {
+          state = saved.active
+          if (this.states.get(state.id) !== state) throw new Error('stale')
+          saved.active = undefined
+          this.options.dropProgress(resume!); this.terminals.add(resume!)
+          state.bookmark = undefined; state.rounds = 0
+          unwrap(state.reader.resumeForRpc())
+          return this.page(state)
+        }
         const binding: DashboardReadBinding = { generationId: hash(root), policyKey: policy,
-          filterKey: hash(JSON.stringify(filter)), asOf: Date.now(), viewKey: 'memory.global.v7', projectKeys: [] }
+          filterKey: hash(JSON.stringify(filter)), asOf: saved?.now ?? Date.now(), viewKey: 'memory.global.v7', projectKeys: [] }
         const directory = saved?.directory?.fork() ?? (marker === 'absent' || saved?.directoryDone ? undefined : new DirectoryStream(opendirSync(path.join(root, 'projects'))).position())
         let reader: DashboardVisibilityReadSession
         try {
-          reader = unwrap(this.options.open(binding, () => this.ended(id)))
+          reader = unwrap(this.options.open(binding, () => this.ended(state?.id ?? id)))
           try {
             unwrap(reader.reserveReadState(BASE_STATE_BYTES))
             if (request.layer === 'home') unwrap(reader.reserveReadState(HOME_STATE_BYTES))
@@ -236,15 +269,23 @@ export class GlobalMemoryReader {
           }
           catch (error) { reader.cancel(); throw error }
         } catch (error) { closeDirectory(directory); throw error }
-        state = { id, reader, bookmark: resume, request: filter, root, marker, policy, filePins: new Map(), keys: saved?.key === undefined ? [] : [saved.key], index: 0,
+        state = { id, reader, bookmark: resume, request: filter, root, marker, policy, snapshot: snapshot.stamp, filePins: new Map(), keys: saved?.key === undefined ? [] : [saved.key], index: 0,
+          expiresAt: saved?.expiresAt, calendarAfter: saved?.calendarAfter, calendarId: saved?.calendarId,
+          processing: { ...(saved?.processing ?? { queued: 0, failed: 0, uncertain: 0, pendingApproval: 0 }) }, latestIssueAt: saved?.latestIssueAt ?? -1,
           directory,
           search: request.relationDepth === undefined ? undefined : newSearch(saved?.search), sourceDone: saved?.sourceDone ?? false,
           directoryDone: saved?.directoryDone ?? marker === 'absent', resumed: saved !== undefined,
-          stage: saved?.stage ?? 0, ordinal: saved?.ordinal ?? 0, memoryAfter: saved?.memoryAfter, sceneAfter: saved?.sceneAfter, sceneRestart: saved?.sceneRestart, personaRestart: saved?.personaRestart,
-          counts: emptyCounts(), incomplete: saved !== undefined, days: new Map(), globalDone: request.layer !== 'home' && request.layer !== 'L3',
-          globalLoaded: false, globalIndex: 0, dayBytes: 0, recentAdded: 0, recent: [], dayKeys: new Set(), date, now: binding.asOf, rounds: 0 }
+          stage: saved?.stage ?? 0, ordinal: saved?.ordinal ?? 0, memoryAfter: saved?.memoryAfter, sceneAfter: saved?.sceneAfter,
+          counts: { ...(saved?.counts ?? emptyCounts()) }, incomplete: (saved?.incomplete ?? false) || !snapshot.complete,
+          days: new Map([...(saved?.days ?? [])].map(([key, day]) => [key, { ...day, records: [...day.records] }])), globalDone: saved?.globalDone ?? (request.layer !== 'home' && request.layer !== 'L3'),
+          globalLoaded: saved?.globalLoaded ?? false, globalIndex: saved?.globalIndex ?? 0, globalFile: saved?.globalFile, globalPersona: saved?.globalPersona, recentAdded: saved?.recentAdded ?? 0,
+          recent: [...(saved?.recent ?? [])], dayKeys: new Set(saved?.dayKeys), date, now: binding.asOf, rounds: 0 }
         this.states.set(id, state)
       } else if (request.action === 'continue' || request.action === 'close') {
+        if (request.action === 'close' && this.progress.has(request.readId)) {
+          this.options.dropProgress(request.readId); this.terminals.add(request.readId)
+          return result('ok', true, { readId: request.readId })
+        }
         state = this.states.get(request.readId)
         if (state === undefined && request.action === 'close' && this.terminals.has(request.readId)) return result('ok', true, { readId: request.readId })
         if (state === undefined) return result('stale', false, { reason: 'global-read-expired' })
@@ -294,7 +335,12 @@ export class GlobalMemoryReader {
         if (!stat?.isFile() || stat.isSymbolicLink() || realpathSync(path.dirname(file)) !== path.join(state.root, 'projects', entry.name)) continue
         state.keys.push(entry.name)
       }
-      if (state.index >= state.keys.length) { this.globalPersonaStep(state, items); continue }
+      if (state.index >= state.keys.length) {
+        const nextSource = state.globalPersona?.sources[state.globalIndex]?.projectKey
+        if (nextSource !== undefined && !state.reader.globalPublicationSources().includes(nextSource) &&
+            state.reader.globalPublicationSources().length >= state.reader.globalPublicationSourceLimit()) { windowFull = true; break }
+        this.globalPersonaStep(state, items); continue
+      }
       const key = state.keys[state.index]!
       const bound = state.reader.globalPublicationSources()
       if (!bound.includes(key) && bound.length >= state.reader.globalPublicationSourceLimit()) { windowFull = true; break }
@@ -308,12 +354,7 @@ export class GlobalMemoryReader {
       if (state.search !== undefined && state.search.queue.length > 0) { this.relationStep(state, items); continue }
       const done = state.sourceDone || this.step(state, key, stage, items)
       if (done && state.search !== undefined && state.search.queue.length > 0) { state.sourceDone = true; continue }
-      if (done) {
-        state.sourceDone = false
-        state.ordinal = 0; state.memoryAfter = undefined; state.sceneAfter = undefined; state.sceneRestart = undefined; state.personaRestart = undefined
-        if (state.request.layer === 'home' && state.stage < 4) state.stage += 1
-        else { state.stage = 0; state.index += 1 }
-      }
+      if (done) this.advanceStage(state)
       } catch (error) {
         if (error instanceof Error && error.message === 'budget-exhausted' && state.reader.remainingReadWork() !== undefined) break
         throw error
@@ -321,6 +362,9 @@ export class GlobalMemoryReader {
     }
     } finally { leaveProofGuard() }
     const finished = state.directoryDone && state.index >= state.keys.length && state.globalDone && (state.search?.queue.length ?? 0) === 0
+    const expiry = state.reader.earliestVisibleExpiry()
+    if (expiry !== undefined) state.expiresAt = state.expiresAt === undefined ? expiry : Math.min(state.expiresAt, expiry)
+    if (state.expiresAt !== undefined && state.expiresAt <= Date.now()) throw new Error('stale')
     const complete = finished && !state.incomplete
     const relation = complete ? 'exact' as const : 'lower_bound' as const
     const counts = Object.fromEntries(layers.map((layer) => [layer, state.request.layer === 'home' || state.request.layer === layer
@@ -331,6 +375,7 @@ export class GlobalMemoryReader {
     if (!config.capture.enabled) pauseReasons.push('capture_disabled')
     if (!config.extraction.enabled) pauseReasons.push('extraction_disabled')
     const global: GlobalMemoryPage = { layer: state.request.layer, query: state.request.query, items: state.request.layer === 'home' ? state.recent : items, counts,
+      ...(state.request.layer === 'home' ? { processing: { ...state.processing } } : {}),
       days: [...state.days.values()].sort((a, b) => a.date.localeCompare(b.date)), activityComplete: complete && state.request.layer === 'home',
       recentAdded: state.request.layer === 'home' ? { value: state.recentAdded, relation: complete ? 'exact' : 'lower_bound' } : { value: null, relation: 'unknown' },
       year: state.request.year, timeZone: state.request.timeZone, generateMemory: this.options.config.generateMemory && this.options.config.capture.enabled && this.options.config.extraction.enabled,
@@ -342,7 +387,7 @@ export class GlobalMemoryReader {
       const identity = stat === undefined ? 'absent' : stat.isSymbolicLink() ? 'symlink' : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`
       if (identity !== state.globalFile.identity) throw new Error('stale')
     }
-    if (state.policy !== this.options.policy() || state.root !== realpathSync(this.options.root()) || directoryMarker(state.root) !== state.marker) throw new Error('stale')
+    if (state.policy !== this.options.policy() || state.root !== realpathSync(this.options.root()) || directoryMarker(state.root) !== state.marker || scanSnapshot(state.root).stamp !== state.snapshot) throw new Error('stale')
     for (const [key, pin] of state.filePins) {
       const folder = path.join(state.root, 'projects', key), file = path.join(folder, 'memory.db'), stat = lstatSync(file, { throwIfNoEntry: false })
       if (!stat?.isFile() || stat.isSymbolicLink() || stat.dev !== pin.dev || stat.ino !== pin.ino || realpathSync(folder) !== folder) throw new Error('stale')
@@ -356,41 +401,74 @@ export class GlobalMemoryReader {
       work.session.projects < state.reader.globalPublicationSources().length ||
       work.session.sqlStatements - handoff.sqlStatements < 64 || work.session.rowsVisited - handoff.rowsVisited < 2048 ||
       work.session.materializedBytes - handoff.materializedBytes < 1024 * 1024 || work.session.keyBytes - handoff.keyBytes < 64 * 1024)
-    // Bookmarks carry positions/restart identities, never trusted scene or persona proofs.
-    // If a whole fresh window still cannot finish that item, fail without payload or another retry.
-    if (exhausted && (state.scene?.restarted || state.persona?.restarted)) throw new Error('budget-exhausted')
+    if (exhausted && (state.scene !== undefined || state.persona !== undefined)) {
+      // Keep the ORIGINAL connections/version stamps. Reset only this bounded work
+      // window; completed root proofs have been compacted, never replayed or skipped.
+      const position = JSON.stringify([state.index, state.stage, state.scene?.name, state.scene?.phase,
+        state.scene?.afterOrdinal, state.scene?.nextMember, state.persona?.afterOrdinal, state.persona?.nextIndex])
+      if (position === state.lastBatchPosition) throw new Error('unavailable')
+      state.lastBatchPosition = position
+      const oldId = state.id
+      const saved: Progress = { ...state, active: state, directory: undefined, key: state.keys[state.index],
+        pin: state.filePins.get(state.keys[state.index] ?? '') }
+      let next: string | undefined
+      next = unwrap(state.reader.retainGlobalProgress(() => {
+        if (saved.active !== undefined) { const active = saved.active; saved.active = undefined; this.retire(active) }
+        if (next !== undefined) { this.progress.delete(next); this.terminals.add(next) }
+      }, state.bookmark))
+      this.progress.set(next, saved)
+      const suspended = state.reader.suspendForRpc(undefined, true)
+      if (suspended.status !== 'ok') { this.options.dropProgress(next); throw new Error(suspended.status) }
+      this.states.delete(oldId); this.terminals.add(oldId)
+      state.id = randomUUID(); state.bookmark = next; this.states.set(state.id, state)
+      global.next = next
+      return result('partial', false, { generatedAt: state.now, readId: oldId, global, reason: 'global-total-budget-limit' })
+    }
     if (finished || exhausted) {
       let next: string | undefined
-      if (exhausted && (!state.directoryDone || state.index < state.keys.length)) {
+      if (exhausted && (!state.directoryDone || state.index < state.keys.length || !state.globalDone)) {
         const saved: Progress = { root: state.root, marker: state.marker, policy: state.policy, request: state.request,
+          snapshot: state.snapshot, now: state.now, counts: { ...state.counts }, incomplete: state.incomplete,
+          processing: { ...state.processing }, latestIssueAt: state.latestIssueAt,
+          globalLoaded: state.globalLoaded, globalDone: state.globalDone, globalIndex: state.globalIndex, globalFile: state.globalFile, globalPersona: state.globalPersona,
+          expiresAt: state.expiresAt, calendarAfter: state.calendarAfter, calendarId: state.calendarId,
+          days: new Map([...state.days].map(([key, day]) => [key, { ...day, records: [...day.records] }])),
+          dayKeys: new Set(state.dayKeys), recent: [...state.recent], recentAdded: state.recentAdded,
           directory: state.directory?.fork(), directoryDone: state.directoryDone, key: state.keys[state.index], pin: state.filePins.get(state.keys[state.index] ?? ''), stage: state.stage,
           ordinal: state.ordinal, memoryAfter: state.memoryAfter, sceneAfter: state.sceneAfter, sourceDone: state.sourceDone,
-          sceneRestart: state.scene === undefined ? undefined : globalMemoryKey(state.keys[state.index]!, state.scene.name),
-          personaRestart: state.persona?.key,
           search: state.search === undefined ? undefined : newSearch(state.search) }
-        try { next = unwrap(state.reader.retainGlobalProgress(() => { closeDirectory(saved.directory); if (next !== undefined) this.progress.delete(next) }, state.bookmark)) }
+        try { next = unwrap(state.reader.retainGlobalProgress(() => { closeDirectory(saved.directory); if (next !== undefined) { this.progress.delete(next); this.ended(next) } }, state.bookmark)) }
         catch (error) { closeDirectory(saved.directory); throw error }
         this.progress.set(next, saved)
       }
       try { unwrap(state.reader.advance(false)) } catch (error) { if (next !== undefined) this.options.dropProgress(next); throw error }
       this.ended(state.id)
       if (next !== undefined) global.next = next
-      return result(complete ? 'ok' : 'partial', complete, { readId: state.id, global,
+      return result(complete ? 'ok' : 'partial', complete, { generatedAt: state.now, readId: state.id, global,
         ...(!complete ? { reason: windowFull ? 'global-source-window-limit' : exhausted ? 'global-total-budget-limit' : 'global-readable-set-partial' } : {}) })
     }
     const suspended = state.reader.suspendForRpc()
     if (suspended.status !== 'ok') throw new Error('budget-exhausted')
     state.cursor = randomUUID()
-    return result('partial', false, { readId: state.id, cursor: state.cursor, global, reason: 'global-scan-pending' })
+    return result('partial', false, { generatedAt: state.now, readId: state.id, cursor: state.cursor, global, reason: 'global-scan-pending' })
+  }
+
+  private advanceStage(state: State): void {
+    state.sourceDone = false
+    state.calendarAfter = undefined; state.calendarId = undefined; state.dayKeys.clear()
+    state.ordinal = 0; state.memoryAfter = undefined; state.sceneAfter = undefined
+    if (state.request.layer === 'home' && state.stage < 6) state.stage += 1
+    else { state.stage = 0; state.index += 1 }
   }
   private globalPersonaStep(state: State, items: GlobalMemoryItem[]): void {
+    if (state.globalLoaded && state.globalPersonaLease === undefined) state.globalPersonaLease = unwrap(state.reader.reserveReadState(512 * 1024)).reservationToken
     if (!state.globalLoaded) {
       const folder = path.join(state.root, 'global'), file = path.join(folder, 'persona.json')
       const directory = lstatSync(folder, { throwIfNoEntry: false }), stat = lstatSync(file, { throwIfNoEntry: false })
       if (stat === undefined) { state.globalFile = { file, identity: 'absent' }; state.globalDone = true; return }
-      if (!directory?.isDirectory() || directory.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink() || stat.size > 32768) { state.incomplete = true; state.globalDone = true; return }
-      if (state.globalPersonaLease === undefined) state.globalPersonaLease = unwrap(state.reader.reserveReadState(128 * 1024)).reservationToken
-      const raw = unwrap(state.reader.chargeRead({ sqlStatements: 0, rowsVisited: 1, materializedBytes: stat.size * 32 + 4096, keyBytes: 1024 }, () => {
+      if (!directory?.isDirectory() || directory.isSymbolicLink() || !stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) { state.incomplete = true; state.globalDone = true; return }
+      if (state.globalPersonaLease === undefined) state.globalPersonaLease = unwrap(state.reader.reserveReadState(512 * 1024)).reservationToken
+      const raw = unwrap(state.reader.chargeRead({ sqlStatements: 0, rowsVisited: 1, materializedBytes: stat.size * 8 + 4096, keyBytes: 1024 }, () => {
         const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW)
         let value: unknown
         try {
@@ -403,7 +481,7 @@ export class GlobalMemoryReader {
         return value
       })) as Record<string, unknown>
       if (raw === null || typeof raw !== 'object' || typeof raw.content !== 'string' || Buffer.byteLength(raw.content) > 8192 ||
-          raw.stale === true || typeof raw.updatedAt !== 'number' || !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt < 0 || raw.updatedAt > 8640000000000000 || !Array.isArray(raw.sources) || raw.sources.length === 0 || raw.sources.length > 100) { state.incomplete = true; state.globalDone = true; return }
+          raw.stale === true || typeof raw.updatedAt !== 'number' || !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt < 0 || raw.updatedAt > 8640000000000000 || !Array.isArray(raw.sources) || raw.sources.length === 0) { state.incomplete = true; state.globalDone = true; return }
       const sources: Array<{ projectKey: string; id: string; revision: number }> = []
       for (const item of raw.sources) {
         if (typeof item !== 'object' || item === null || typeof item.projectKey !== 'string' || !isValidProjectKey(item.projectKey) ||
@@ -420,7 +498,7 @@ export class GlobalMemoryReader {
     if (source !== undefined) {
       const bound = state.reader.globalPublicationSources()
       if (!bound.includes(source.projectKey) && bound.length >= state.reader.globalPublicationSourceLimit()) {
-        state.incomplete = true; state.globalDone = true; return
+        throw new Error('budget-exhausted')
       }
       unwrap(state.reader.selectGlobalSource(source.projectKey))
       if (!state.filePins.has(source.projectKey)) {
@@ -441,10 +519,11 @@ export class GlobalMemoryReader {
   }
 
   private emit(state: State, item: GlobalMemoryItem, items: GlobalMemoryItem[]): void {
-    if (Buffer.byteLength(item.content) > 8192 || itemResidentBytes(item) > PAGE_STATE_BYTES - 8192) { state.incomplete = true; return }
+    if (Buffer.byteLength(item.content) > (item.layer === 'L0' ? 32768 : item.layer === 'L1' ? 8192 : 65536) || itemResidentBytes(item) > PAGE_STATE_BYTES - 8192) { state.incomplete = true; return }
     const query = state.request.query.toLocaleLowerCase()
-    if (!item.routes?.includes('relation') && query !== '' && !tokenize(query).slice(0, 32).some((term) => `${item.content}\n${item.scene ?? ''}`.toLocaleLowerCase().includes(term.toLocaleLowerCase()))) return
-    if (state.request.scene !== undefined && (item.layer !== 'L1' || item.projectKey !== state.request.scene.projectKey || item.scene !== state.request.scene.name)) return
+    if (!item.routes?.includes('relation') && query !== '' && !recallQueryTerms(query).some((term) => recallTermMatches(`${item.content}\n${item.scene ?? ''}`, term))) return
+    if (state.request.scene !== undefined && (item.layer !== 'L1' || item.projectKey !== state.request.scene.projectKey ||
+        (item.scene?.trim() || 'general') !== state.request.scene.name)) return
     const search = state.search, key = searchKey(item.projectKey, item.id)
     const route = item.routes?.includes('relation') ? 'relation' as const : 'profile_lexical' as const
     const prior = search?.emitted.get(key)
@@ -459,8 +538,8 @@ export class GlobalMemoryReader {
       search.emitted.set(key, route)
       item.routes = prior === 'relation' ? ['profile_lexical', 'relation'] : [route]
       if (route === 'profile_lexical') {
-        const terms = tokenize(query).slice(0, 32), text = item.content.toLocaleLowerCase()
-        item.score = terms.length === 0 ? 0 : terms.filter((term) => text.includes(term.toLocaleLowerCase())).length / terms.length
+        const terms = recallQueryTerms(query), text = item.content.toLocaleLowerCase()
+        item.score = terms.length === 0 ? 0 : terms.filter((term) => recallTermMatches(text, term)).length / terms.length
         if ((state.request.relationDepth ?? 0) > 0 && item.score > 0 && item.revision !== undefined && search.seeds < 8) {
           search.seeds += 1; search.visited.clear(); search.visited.add(key)
           search.queue.push({ projectKey: item.projectKey, id: item.id, revision: item.revision, depth: 0,
@@ -543,7 +622,7 @@ export class GlobalMemoryReader {
     finish()
   }
 
-  /** Resume only within this reader's version/TTL-fenced memo; bookmarks restart from sceneAfter. */
+  /** Stream complete membership under the original connection/version/TTL fence. */
   private sceneStep(state: State, key: string, items: GlobalMemoryItem[]): boolean {
     const reader = state.reader
     if (state.scene === undefined) {
@@ -554,25 +633,23 @@ export class GlobalMemoryReader {
         return true
       }
       if (row.name === undefined) { state.incomplete = true; return true }
-      if (row.nameBytes > 512 || !row.frontierReady || row.summaryBytes > 65_536 || row.memoryCount > SCENE_MEMBER_LIMIT) {
-        state.incomplete = true; state.sceneAfter = { memoryCount: row.memoryCount, name: row.name }; state.sceneRestart = undefined
+      if (row.nameBytes > 512 || !row.frontierReady || row.summaryBytes > 65_536) {
+        state.incomplete = true; state.sceneAfter = { memoryCount: row.memoryCount, name: row.name }
         return !page.hasMore
       }
-      const lease = unwrap(reader.reserveReadState(4096 + row.memoryCount * 1024))
-      let keyLease: string
-      try { keyLease = unwrap(reader.reserveReadKeys(512 + row.memoryCount * 288)).reservationToken }
-      catch (error) { reader.releaseReadState(lease.reservationToken); throw error }
+      const lease = unwrap(reader.reserveReadState(DERIVED_STATE_BYTES))
+      const proofToken = unwrap(reader.beginManagedDerivedProof(key, 'L2', JSON.stringify([row.name, row.memoryCount,
+        row.updatedAt, row.summaryBytes, row.summaryComplete])))
       state.scene = { row, name: row.name, hasMore: page.hasMore, members: [], nextMember: 0,
-        memberHasMore: true, phase: 'members', restarted: state.sceneRestart === globalMemoryKey(key, row.name),
-        lease: lease.reservationToken, keyLease }
+        memberHasMore: true, phase: 'members', proofToken, lease: lease.reservationToken }
       return false
     }
     const current = state.scene
     const finish = (unresolved = false): boolean => {
       if (unresolved) state.incomplete = true
-      unwrap(reader.releaseReadState(current.lease)); unwrap(reader.releaseReadState(current.keyLease))
+      unwrap(reader.releaseReadState(current.lease)); reader.finishManagedDerivedProof(current.proofToken)
       state.sceneAfter = { memoryCount: current.row.memoryCount, name: current.name }
-      state.scene = undefined; state.sceneRestart = undefined
+      state.scene = undefined
       return !current.hasMore
     }
     if (current.phase === 'members') {
@@ -581,8 +658,8 @@ export class GlobalMemoryReader {
       if (page.rows.some((member, index) => !isValidDashboardSceneMember(member) ||
           (index > 0 ? member.ordinal <= page.rows[index - 1]!.ordinal :
             current.afterOrdinal !== undefined && member.ordinal <= current.afterOrdinal)) ||
-          current.members.length + page.rows.length > Math.min(SCENE_MEMBER_LIMIT, current.row.memoryCount)) return finish(true)
-      current.members.push(...page.rows)
+          unwrap(reader.managedDerivedDigest(current.proofToken)).count + page.rows.length > current.row.memoryCount) return finish(true)
+      current.members = page.rows; current.nextMember = 0
       current.afterOrdinal = page.rows.at(-1)?.ordinal ?? current.afterOrdinal
       current.memberHasMore = page.hasMore
       current.phase = 'proof'
@@ -593,17 +670,19 @@ export class GlobalMemoryReader {
         const member = current.members[current.nextMember]!
         const proof = unwrap(reader.proveManagedSceneMember(key, member.memoryId!, member.revision))
         if (proof !== 'visible') return finish(proof !== 'hidden')
+        unwrap(reader.commitManagedDerivedMember(current.proofToken, member))
         current.nextMember += 1
       } else {
         if (current.memberHasMore) current.phase = 'members'
-        else if (current.members.length !== current.row.memoryCount) return finish(true)
+        else if (unwrap(reader.managedDerivedDigest(current.proofToken)).count !== current.row.memoryCount) return finish(true)
         else current.phase = 'final'
       }
       return false
     }
     const final = unwrap(reader.readManagedSceneFinal(key, { name: current.name, memoryCount: current.row.memoryCount,
       updatedAt: current.row.updatedAt, summaryBytes: current.row.summaryBytes, summaryComplete: current.row.summaryComplete,
-      memberCount: current.members.length, memberDigest: dashboardSceneMemberDigest(current.members) }))
+      memberCount: unwrap(reader.managedDerivedDigest(current.proofToken)).count,
+      memberDigest: unwrap(reader.managedDerivedDigest(current.proofToken)).digest, proofToken: current.proofToken }))
     if (final.state !== 'visible' || final.summary === undefined) return finish(final.state !== 'hidden')
     this.emit(state, { key: globalMemoryKey(key, `scene/${current.name}`), layer: 'L2', projectKey: key, id: current.name,
       content: final.summary, scene: current.name, createdAt: current.row.updatedAt, updatedAt: current.row.updatedAt,
@@ -611,42 +690,49 @@ export class GlobalMemoryReader {
     return finish()
   }
 
-  /** Only this reader owns source proof progress; a fresh bookmark starts again with Plan. */
+  /** Page every persona source, compacting proofs before the next member. */
   private personaStep(state: State, key: string, items: GlobalMemoryItem[]): boolean {
     const reader = state.reader
     // The small pre-plan marker fits BASE_STATE_BYTES and also bounds failures before plan admission.
-    const current: PersonaProgress = state.persona ??= { key, nextIndex: 0, restarted: state.personaRestart === key }
+    const current: PersonaProgress = state.persona ??= { key, nextIndex: 0, members: [], hasMore: true }
     if (current.key !== key) throw new Error('stale')
     const finish = (unresolved = false): boolean => {
       if (unresolved) state.incomplete = true
       if (current.lease !== undefined) unwrap(reader.releaseReadState(current.lease))
-      if (current.keyLease !== undefined) unwrap(reader.releaseReadState(current.keyLease))
-      state.persona = undefined; state.personaRestart = undefined
+      if (current.plan?.proofToken !== undefined) reader.finishManagedDerivedProof(current.plan.proofToken)
+      state.persona = undefined
       return true
     }
     if (current.plan === undefined) {
-      const plan = unwrap(reader.readManagedPersonaPlan(key))
+      const plan = unwrap(reader.readManagedPersonaPlan(key, true))
       if (plan.state !== 'visible') return finish(plan.state !== 'hidden')
       if (plan.sourceIds === undefined || plan.sourceRevisions === undefined || plan.sourceCount === undefined ||
           plan.updatedAt === undefined || plan.contentBytes === undefined) return finish(true)
       if (plan.stale === true) return finish()
-      // The bounded transient plan fits the current page lease. Adopt it only after both
-      // resident charges succeed: <=100 IDs plus revision-map entries; no body is retained.
-      const lease = unwrap(reader.reserveReadState(4096 + plan.sourceIds.length * 1024))
-      let keyLease: string
-      try { keyLease = unwrap(reader.reserveReadKeys(512 + plan.sourceIds.reduce((bytes, id) => bytes + Buffer.byteLength(id) + 32, 0))).reservationToken }
-      catch (error) { reader.releaseReadState(lease.reservationToken); throw error }
-      current.plan = { sourceIds: plan.sourceIds, sourceRevisions: plan.sourceRevisions, sourceCount: plan.sourceCount,
-        updatedAt: plan.updatedAt, contentBytes: plan.contentBytes }
-      current.lease = lease.reservationToken; current.keyLease = keyLease
+      const lease = unwrap(reader.reserveReadState(DERIVED_STATE_BYTES))
+      current.plan = { sourceIds: [], sourceRevisions: {}, sourceCount: plan.sourceCount,
+        updatedAt: plan.updatedAt, contentBytes: plan.contentBytes,
+        proofToken: unwrap(reader.beginManagedDerivedProof(key, 'L3', JSON.stringify([plan.sourceCount, plan.updatedAt, plan.contentBytes]))) }
+      current.lease = lease.reservationToken
       return false
     }
     const plan = current.plan
-    if (current.nextIndex < plan.sourceIds.length) {
-      const id = plan.sourceIds[current.nextIndex]!
-      const proof = unwrap(reader.proveManagedPersonaSource(key, id, plan.sourceRevisions[id]!))
-      if (proof !== 'visible') return finish(true)
+    if (current.nextIndex < current.members.length) {
+      const member = current.members[current.nextIndex]!
+      const proof = unwrap(reader.proveManagedPersonaSource(key, member.memoryId!, member.revision))
+      if (proof !== 'visible') return finish(proof !== 'hidden')
+      unwrap(reader.commitManagedDerivedMember(plan.proofToken!, member))
       current.nextIndex += 1
+      return false
+    }
+    if (current.hasMore) {
+      const page = unwrap(reader.readManagedPersonaSourcePage(key, current.afterOrdinal))
+      const completed = unwrap(reader.managedDerivedDigest(plan.proofToken!)).count
+      if (page.rows.length === 0 && page.hasMore || completed + page.rows.length > plan.sourceCount ||
+          page.rows.some((row, index) => !isValidDashboardSceneMember(row) || row.ordinal !== completed + index)) return finish(true)
+      current.members = page.rows; current.nextIndex = 0; current.hasMore = page.hasMore
+      current.afterOrdinal = page.rows.at(-1)?.ordinal ?? current.afterOrdinal
+      if (!page.hasMore && completed + page.rows.length !== plan.sourceCount) return finish(true)
       return false
     }
     const body = unwrap(reader.readManagedPersonaBody(key, plan))
@@ -658,6 +744,35 @@ export class GlobalMemoryReader {
 
   private step(state: State, key: string, stage: number, items: GlobalMemoryItem[]): boolean {
     const reader = state.reader
+    if (stage === 6) {
+      const page = unwrap(reader.readManagedPage(key, 'candidate', state.memoryAfter, 1, 8192, 'global-v7'))
+      for (const item of page.items) {
+        if (item.state === 'visible') state.processing.pendingApproval++
+        else if (item.state === 'unresolved') state.incomplete = true
+      }
+      state.memoryAfter = page.nextCursor
+      return !page.hasMore
+    }
+    if (stage === 5) {
+      // One job + at most 25 ownership keys and 24 indexed L0 identity probes; no source body is read.
+      const row = unwrap(reader.readProject(key, { ...cost(4096), rowsVisited: 80 }, store => store.globalExtractionJobRow(state.ordinal)))
+      if (row === undefined) return true
+      state.ordinal = row.ordinal
+      if (!row.sourcesComplete) state.incomplete = true
+      if (row.hasPendingConversation && ['queued', 'ready', 'dispatching', 'result_ready'].includes(row.status)) state.processing.queued++
+      if (row.status === 'failed') state.processing.failed++
+      if (row.status === 'uncertain_remote') state.processing.uncertain++
+      if (['failed', 'uncertain_remote'].includes(row.status) && row.updatedAt > state.latestIssueAt && row.error !== 'content_deleted') {
+        state.latestIssueAt = row.updatedAt
+        const reason = row.error.includes('max-tokens') ? '输出达到上限' : row.error.includes('invalid-json') ? '返回内容不是完整 JSON' :
+          row.error.includes('policy_changed') ? '设置在提炼前发生变化' : '提炼未完成，原始对话仍保留'
+        const time = Number.isSafeInteger(row.updatedAt) && row.updatedAt >= 0 && row.updatedAt <= 8_640_000_000_000_000
+          ? new Intl.DateTimeFormat('zh-CN', { timeZone: state.request.timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(row.updatedAt) : '时间未知'
+        state.processing.latestIssue = `${time} · ${row.provider || '未知来源'}/${row.model || '未知模型'}：${reason}`
+      }
+      return false
+    }
     if (stage === 0) {
       const row = unwrap(reader.readProject(key, cost(34 * 1024), (store) => store.globalSourceRow(state.ordinal)))
       if (row === undefined) return true
@@ -671,7 +786,7 @@ export class GlobalMemoryReader {
       return false
     }
     if (stage === 1) {
-      const page = unwrap(reader.readManagedPage(key, 'approved', state.memoryAfter, 1, 8192, 'global-v7'))
+      const page = unwrap(reader.readManagedPage(key, state.request.status ?? 'approved', state.memoryAfter, 1, 8192, 'global-v7'))
       for (const item of page.items) {
         if (item.state !== 'visible' || item.record === undefined) { if (item.state === 'unresolved') state.incomplete = true; continue }
         this.emit(state, this.memoryItem(state, key, item.record), items)
@@ -681,9 +796,12 @@ export class GlobalMemoryReader {
     }
     if (stage === 2) return this.sceneStep(state, key, items)
     if (stage === 3) return this.personaStep(state, key, items)
-    const row = unwrap(reader.readProject(key, cost(2048), (store) => store.globalRevisionRow(state.ordinal)))
+    const row = unwrap(reader.readProject(key, cost(2048), (store) => store.globalCalendarRevision(state.calendarAfter)))
     if (row === undefined) return true
-    if (row.id === undefined || row.at === undefined || row.revision === undefined || row.reason === undefined) { state.incomplete = true; state.ordinal = row.ordinal; return false }
+    if (row.id === undefined || row.revision === undefined) throw new Error('unavailable')
+    state.calendarAfter = { id: row.id, revision: row.revision }
+    if (state.calendarId !== row.id) { state.dayKeys.clear(); state.calendarId = row.id }
+    if (row.at === undefined || row.reason === undefined) { state.incomplete = true; state.ordinal = row.ordinal; return false }
     if (row.at <= state.now && (row.revision === 1 || !/approv|forget|reject|review/i.test(row.reason))) {
       const parts = Object.fromEntries(state.date.formatToParts(row.at).map((part) => [part.type, part.value]))
       const date = `${parts.year}-${parts.month}-${parts.day}`
@@ -693,18 +811,13 @@ export class GlobalMemoryReader {
       if (Number(parts.year) === state.request.year || recent) {
         const proof = unwrap(reader.verifyEventMemory(key, row.id))
         if (proof.state === 'visible') {
-          const id = globalMemoryKey(key, row.id), kind = row.revision === 1 ? 'added' : 'updated', identity = `${date}:${kind}:${id}`
+          const kind = row.revision === 1 ? 'added' : 'updated', identity = `${date}:${kind}`
           if (!state.dayKeys.has(identity)) {
-            const retainedBytes = 2 * Buffer.byteLength(identity) + 4 * Buffer.byteLength(id) + 512
-            if (state.dayKeys.size >= 128 || state.dayBytes + retainedBytes > 48 * 1024) state.incomplete = true
-            else {
-              state.dayBytes += retainedBytes
-              state.dayKeys.add(identity)
-              if (recent) state.recentAdded += 1
-              if (Number(parts.year) !== state.request.year) { state.ordinal = row.ordinal; return false }
+            state.dayKeys.add(identity)
+            if (recent) state.recentAdded += 1
+            if (Number(parts.year) === state.request.year) {
               const day = state.days.get(date) ?? { date, added: 0, updated: 0, records: [] }
               day[kind] += 1
-              if (!day.records.includes(id)) day.records.push(id)
               state.days.set(date, day)
             }
           }

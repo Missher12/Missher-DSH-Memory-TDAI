@@ -48,7 +48,7 @@ export interface MemoryTdaiConfig {
     /** Explicit model route. When absent, the active session's committed route is pinned at capture time. */
     provider?: string
     model?: string
-    /** Output-token cap for one extraction call. @default 1200 */
+    /** Output-token cap for one extraction call, including reasoning on adapters that require it. @default 4096 */
     maxTokens?: number
     /** Do not extract turns shorter than this many characters. @default 40 */
     minTurnChars?: number
@@ -91,6 +91,12 @@ export interface MemoryTdaiConfig {
     /** Opt in to a cross-project profile when a project has none. @default false */
     global?: boolean
   }
+  character?: {
+    /** Opt-in stable assistant character guidance. @default false */
+    enabled?: boolean
+    /** User-editable base description; empty keeps the proposed default. @default '' */
+    description?: string
+  }
   offload?: {
     /** Replace very large text tool results with a short retrieval stub. @default true */
     enabled?: boolean
@@ -131,6 +137,7 @@ export interface ResolvedConfig {
   recall: { enabled: boolean; maxResults: number; maxTokens: number; maxChars: number; minScore: number; dedupeSession: boolean; includePersona: boolean }
   retention: { days: number }
   persona: { global: boolean }
+  character: { enabled: boolean; description: string }
   offload: { enabled: boolean; minChars: number; maxChars: number; excludeTools: string[] }
   semantic: { enabled: boolean; provider?: string; model?: string }
 }
@@ -208,7 +215,7 @@ export function resolveConfig(raw: MemoryTdaiConfig | undefined): ResolvedConfig
       maxMemoriesPerPass: numberIn(input.extraction?.maxMemoriesPerPass, 12, 1, 50),
       provider: typeof input.extraction?.provider === 'string' ? input.extraction.provider : undefined,
       model: typeof input.extraction?.model === 'string' ? input.extraction.model : undefined,
-      maxTokens: numberIn(input.extraction?.maxTokens, 1200, 128, 16_000),
+      maxTokens: numberIn(input.extraction?.maxTokens, 4096, 128, 16_000),
       minTurnChars: numberIn(input.extraction?.minTurnChars, 40, 0, 100_000),
       maxWaitSeconds: numberIn(input.extraction?.maxWaitSeconds, 21_600, 60, 604_800),
     },
@@ -223,6 +230,10 @@ export function resolveConfig(raw: MemoryTdaiConfig | undefined): ResolvedConfig
     },
     retention: { days: numberIn(input.retention?.days, 0, 0, 3650) },
     persona: { global: bool(input.persona?.global, false) },
+    character: {
+      enabled: bool(input.character?.enabled, false),
+      description: typeof input.character?.description === 'string' ? input.character.description.trim().slice(0, 400) : '',
+    },
     offload: {
       enabled: bool(input.offload?.enabled, true),
       minChars: numberIn(input.offload?.minChars, 8000, 500, 1_000_000),

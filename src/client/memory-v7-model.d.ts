@@ -6,11 +6,14 @@ export function memoryYear(year: number, timeZone: string, days: GlobalMemoryPag
 export function memoryMetric(metric?: { value: number | null; relation: string }): string
 export function readGlobalMemory(transport: (request: ReadDashboardRequest) => Promise<ReadDashboardResult>,
   request: Extract<ReadDashboardRequest, { action: 'global' }>, cancelled?: () => boolean): Promise<ReadDashboardResult | undefined>
+export function readCompleteGlobalMemory(transport: (request: ReadDashboardRequest) => Promise<ReadDashboardResult>,
+  request: Extract<ReadDashboardRequest, { action: 'global' }>, cancelled?: () => boolean,
+  onProgress?: (value: ReadDashboardResult) => void): Promise<ReadDashboardResult | undefined>
 
 export type MemorySwitchPatch = { generateMemory: boolean; useMemory?: never } | { useMemory: boolean; generateMemory?: never }
-export type MemorySettingsPatch = MemorySwitchPatch
+export type MemorySettingsPatch = MemorySwitchPatch | { characterEnabled: boolean } | { characterDescription: string }
 export type MemorySettingsMutationResult = { kind: 'ignored' | 'failed' } |
-  { kind: 'saved'; settings: { generateMemory: boolean; useMemory: boolean } }
+  { kind: 'saved'; settings: { generateMemory: boolean; useMemory: boolean; characterEnabled?: boolean; characterDescription?: string } }
 export function createMemorySettingsMutation(actions: {
   readDashboard: (request: ReadDashboardRequest) => Promise<ReadDashboardResult>;
   updateSettingsAck: (patch: MemorySettingsPatch) => Promise<import('../remote-contract.js').ReadDashboardAck>

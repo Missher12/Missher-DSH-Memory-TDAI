@@ -58,6 +58,7 @@ export interface LlmChunkLike {
 }
 
 export interface LlmLike {
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<{ reasoning?: { efforts: Array<{ id: string }> } }>
   stream(options: {
     provider: string
     model: string

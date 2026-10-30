@@ -16,12 +16,12 @@ import { performance } from 'node:perf_hooks'
 import { matchesAgentGlob, type ResolvedConfig } from './config.js'
 import type { HostContextLike, MessageLike, SessionEventLike, SessionLike } from './dsh.js'
 import { asRecord, textOfMessage } from './dsh.js'
-import { extractionRequestIdentityHash, formatConversation, ObservedStreamError, parseExtractionJson, requestIdentityHash, requestExtractionDetailed, requestTextDetailed, routeFromHost, type ConversationEntry, type ObservedUsage } from './extract.js'
+import { extractionRequestIdentityHash, formatConversation, ObservedStreamError, parseExtractionJson, prepareBackgroundRoute, requestIdentityHash, requestExtractionDetailed, requestTextDetailed, routeFromHost, type ConversationEntry, type ObservedUsage, type Route } from './extract.js'
 import { buildPersonaUserPrompt, PERSONA_SYSTEM_PROMPT } from './prompts.js'
 import { isValidProjectKey, projectDbPath, projectIdentity, type ProjectIdentity } from './project.js'
 import { ControlLedger, type ContentDeletionIntent, type CoverageWindow } from './control.js'
-import { classifyInput, classifyQuery, coverageForDay, dateRange, mergeRouteCandidates, normalizeExactQuestion, packEvidence, rankTextCandidates } from './r41.js'
-import { evaluationRunCountForSourceRefsFile, MEMORY_SCHEMA_VERSION, openProjectStore, initializeTokenizer, tokenize, type ActivityDay, type CaptureIdentityFenceCandidate, type DashboardStats, type EvaluationCase, type EvaluationRun, type EventDayMetrics, type EventOverviewMetrics, type ExperienceRecord, type ExtractionJob, type ExtractionJobSummary, type MemoryRecord, type MemoryRevision, type MemoryStore, type OriginalMessageIdentity, type PersonaRecord, type RelationCandidate, type RelationRecord, type RetrievalStrategy, type RevisionCandidate, type SceneRecord, type SearchHit, type TaskContextRecord } from './store.js'
+import { classifyInput, classifyQuery, coverageForDay, dateRange, isConversationSource, mergeRouteCandidates, normalizeExactQuestion, packEvidence, rankTextCandidates } from './r41.js'
+import { evaluationRunCountForSourceRefsFile, MEMORY_SCHEMA_VERSION, openProjectStore, initializeTokenizer, tokenize, recallQueryTerms, recallTermMatches, type ActivityDay, type CaptureIdentityFenceCandidate, type DashboardStats, type EvaluationCase, type EvaluationRun, type EventDayMetrics, type EventOverviewMetrics, type ExperienceRecord, type ExtractionJob, type ExtractionJobSummary, type MemoryRecord, type MemoryRevision, type MemoryStore, type OriginalMessageIdentity, type PersonaRecord, type RelationCandidate, type RelationRecord, type RetrievalStrategy, type RevisionCandidate, type SceneRecord, type SearchHit, type TaskContextRecord } from './store.js'
 import { estimateTokens } from './tokens.js'
 import { extractionJobSourceIds, inspectMemoryDatabaseIdentity, inspectSqliteSchema, reconcileRecoverySourceConsumption, snapshotSqliteFile, type MemoryDatabaseIdentity, type SqliteSchemaInspection } from './sqlite-inspection.js'
 import { BillableResultStore, type BillableResultOperation, type BillableUsageReceipt, type SavedBillableResult } from './billable-results.js'
@@ -31,11 +31,14 @@ import type { DashboardReadBinding, DashboardReadOutcome } from './dashboard-rea
 import { DashboardVisibilityReadSession, normalizeDashboardVisibilityBinding } from './dashboard-visibility.js'
 import type { DashboardDirectoryMemberHandle } from './dashboard-visibility.js'
 import { DashboardAggregateService } from './dashboard-aggregate.js'
+import { COMMUNICATION_STYLE_SCENE, DEFAULT_CHARACTER_DESCRIPTION, explicitCommunicationPreferences, formatCharacterGuidance, MAX_STYLE_ITEMS, MAX_STYLE_SCAN_PER_PROJECT, type LearnedStylePreference } from './character.js'
 import type { ReadDashboardRequest, ReadDashboardResult } from './remote-contract.js'
 import { openProjectStoreReadOnly } from './store.js'
 
 /** One extraction pass covers at most this many conversation entries. */
 const MAX_BATCH = 24
+/** Extraction prior scans never open more than this many other project stores. */
+const MAX_PRIOR_PROJECTS = 8
 const EXTRACTION_RETRY_DELAY_MS = 30_000
 const EXTRACTION_BLOCKED_POLL_MS = 300_000
 
@@ -142,10 +145,10 @@ function buildRecallContext(input: {
   if (personaContent !== '') {
     personaBlock = estimateTokens(personaContent) <= 110
       ? `<persona-summary>\n${personaContent}\n</persona-summary>\n`
-      : '<persona-summary omitted="complete-content-over-budget" /> Use memory_profile to inspect the complete profile.\n'
+      : ''
   }
   const closing = '</memory-context>'
-  const base = `${header}${personaBlock}${closing}`
+  const base = `${header}${closing}`
   const maxEvidenceChars = input.maxChars > 0 ? Math.max(0, input.maxChars - base.length) : Number.POSITIVE_INFINITY
   const effectiveAt = input.effectiveAt ?? Date.now()
   const packet = packEvidence(input.hits.map(({ record, score }) => ({
@@ -161,10 +164,15 @@ function buildRecallContext(input: {
   })), input.maxTokens, estimateTokens(base), maxEvidenceChars)
   const selectedItems = packet.items.slice(0, input.maxResults)
   const body = selectedItems.map((item) => `- [${item.id}@r${item.revision}] ${item.content}\n`).join('')
+  const fits = (text: string): boolean => estimateTokens(text) <= input.maxTokens &&
+    (input.maxChars <= 0 || text.length <= input.maxChars)
+  if (!fits(`${header}${personaBlock}${body}${closing}`)) personaBlock = ''
+  const text = `${header}${personaBlock}${body}${closing}`
+  const included = (body !== '' || personaBlock !== '') && fits(text)
   return {
-    ...(body === '' ? {} : { text: `${header}${personaBlock}${body}${closing}` }),
-    selected: selectedItems.map((item) => item.id),
-    usedTokens: body === '' ? 0 : estimateTokens(header + personaBlock + body + closing),
+    ...(included ? { text } : {}),
+    selected: included ? selectedItems.map((item) => item.id) : [],
+    usedTokens: included ? estimateTokens(text) : 0,
     omitted: [...packet.gaps, ...packet.items.slice(input.maxResults).map((item) => `${item.id}:result_limit`)],
   }
 }
@@ -242,6 +250,8 @@ export interface DashboardSnapshot {
     extractionEveryN: number
     autoApproveConfidence: number
     extractionEnabled: boolean
+    characterEnabled: boolean
+    characterDescription: string
   }
   lastError?: string
 }
@@ -391,6 +401,7 @@ type GlobalRecallReason = 'pending' | 'injected' | 'memory-use-disabled' | 'runt
   | 'read-unavailable' | 'no-candidates' | 'no-selection'
   | 'scope-unavailable' | 'reference-invalid' | 'identity-unavailable' | 'no-visible-candidates'
   | 'call-limit' | 'unexpected-error' | 'stale' | 'expired' | 'evicted' | 'budget-exhausted' | 'unavailable-probe'
+  | 'persona-invalidated-before-publication'
 interface GlobalRecallDiagnostic {
   stage: GlobalRecallStage
   reason: GlobalRecallReason
@@ -473,7 +484,9 @@ export class MemoryRuntime {
           generateMemory: this.config.generateMemory, useMemory: this.config.useMemory,
           mode: this.config.mode, recallMaxTokens: this.config.recall.maxTokens,
           extractionEveryN: this.config.extraction.everyNConversations, extractionEnabled: this.config.extraction.enabled,
+          extractionProvider: this.config.extraction.provider ?? '', extractionModel: this.config.extraction.model ?? '',
           includePersona: this.config.recall.includePersona, globalPersona: this.config.persona.global,
+          characterEnabled: this.config.character.enabled, characterDescription: this.config.character.description,
         }),
         activeProjectKey: () => this.activeProjectKey,
         lastError: () => this.lastError,
@@ -651,7 +664,7 @@ export class MemoryRuntime {
     const normalizeMessage = (raw: unknown, fallbackRole: string): MessageLike | undefined => {
       if (raw === null || typeof raw !== 'object') return undefined
       const message = raw as MessageLike
-      if (typeof message.role !== 'string' || !Array.isArray(message.content)) return undefined
+      if (message.role !== fallbackRole || !Array.isArray(message.content) || !isConversationSource(message.source?.kind, fallbackRole)) return undefined
       const id = typeof message.id === 'string' && message.id !== '' ? message.id : `spooled-${randomUUID()}`
       const content = message.content.flatMap((block) => block?.type === 'text' && typeof block.text === 'string'
         ? [{ type: 'text', text: block.text }] : [])
@@ -1005,6 +1018,17 @@ export class MemoryRuntime {
         this.config.extraction.everyNConversations = Math.max(1, Math.min(100, Math.floor(raw.extractionEveryN)))
       }
       if (typeof raw.extractionEnabled === 'boolean') this.config.extraction.enabled = raw.extractionEnabled
+      if (typeof raw.extractionProvider === 'string' && typeof raw.extractionModel === 'string' &&
+          raw.extractionProvider.length <= 160 && raw.extractionModel.length <= 240 &&
+          !!raw.extractionProvider.trim() === !!raw.extractionModel.trim()) {
+        this.config.extraction.provider = raw.extractionProvider.trim() || undefined
+        this.config.extraction.model = raw.extractionModel.trim() || undefined
+      }
+      if (typeof raw.characterEnabled === 'boolean') this.config.character.enabled = raw.characterEnabled
+      if (typeof raw.characterDescription === 'string') {
+        const description = raw.characterDescription.trim()
+        this.config.character.description = description === '' ? '' : description.slice(0, 400)
+      }
     } catch (error) {
       this.lastError = `settings load failed: ${messageOf(error)}`
     }
@@ -1016,22 +1040,17 @@ export class MemoryRuntime {
       if (previous) { previous.hostTurn = undefined; previous.hostStep = undefined }
       return
     }
-    if (this.maintenance) {
-      const previous = this.sessions.get(session.id)
-      if (previous) { previous.hostTurn = undefined; previous.hostStep = undefined }
-      this.spoolCaptureEvent(session, event); return
-    }
-    const cwd = sessionCwd(session, this.stateRoot)
-    if (cwd === undefined) return
-    const project = projectIdentity(cwd)
-    this.activeProjectKey = project.key
-    const buffer = this.bufferFor(session.id, project)
-    const store = this.store(project)
-    if (buffer.entries.length === 0) {
-      // Recover turns that were captured before a restart/failed extraction.
-      this.refreshBuffer(session.id, buffer)
-    }
     try {
+      if (this.maintenance) {
+        const previous = this.sessions.get(session.id)
+        if (previous) { previous.hostTurn = undefined; previous.hostStep = undefined }
+        this.spoolCaptureEvent(session, event); return
+      }
+      const cwd = sessionCwd(session, this.stateRoot)
+      if (cwd === undefined) return
+      const project = projectIdentity(cwd)
+      this.activeProjectKey = project.key
+      const buffer = this.bufferFor(session.id, project)
       // Header snapshots alone may belong to an older turn. Only ordered committed events establish ownership.
       const ordered = !this.replayingCaptureSpool && Number.isSafeInteger(event.seq) && event.seq! >= 0 &&
         (buffer.hostSequence === undefined || event.seq! > buffer.hostSequence)
@@ -1039,6 +1058,19 @@ export class MemoryRuntime {
         buffer.hostTurn = undefined; buffer.hostStep = undefined
       }
       if (ordered) buffer.hostSequence = event.seq
+      // Still account for ignored events in the Host sequence, without opening a project store for them.
+      if (event.type === 'user/message') {
+        const message = event.data as MessageLike | undefined
+        if (message?.role !== 'user' || !isConversationSource(message.source?.kind, 'user')) return
+      } else if (event.type === 'assistant/message') {
+        const message = (event.data as { message?: MessageLike } | undefined)?.message
+        if (message?.role !== 'assistant' || !isConversationSource(message.source?.kind, 'assistant')) return
+      }
+      const store = this.store(project)
+      if (buffer.entries.length === 0) {
+        // Recover turns that were captured before a restart/failed extraction.
+        this.refreshBuffer(session.id, buffer)
+      }
       const rememberContext = (sourceId: string, created: boolean): void => {
         if (created && ordered && buffer.hostTurn !== undefined && buffer.hostStep !== undefined) {
           store.recordSourceRequestContext({ sourceId, sessionId: session.id, turn: buffer.hostTurn, step: buffer.hostStep, seq: event.seq! })
@@ -1073,7 +1105,6 @@ export class MemoryRuntime {
         case 'user/message': {
           const message = event.data as MessageLike | undefined
           if (message === undefined || message.role !== 'user') return
-          if (message.source?.kind === 'memory' || message.source?.kind === 'runtime-context') return
           const text = clamp(textOfMessage(message), this.config.capture.maxCharsPerMessage)
           if (text === '') return
           const sourceEventId = stableSourceEventId(session, event, message, 'user')
@@ -1098,9 +1129,15 @@ export class MemoryRuntime {
         case 'assistant/message': {
           const data = event.data as { message?: MessageLike } | undefined
           const message = data?.message
-          if (message?.source?.kind === 'memory' || message?.source?.kind === 'runtime-context') return
+          if (message === undefined) return
+          const commitAssistantRoute = (): void => {
+            if (turnOf(event) !== buffer.hostTurn || stepOf(event) !== buffer.hostStep) return
+            const source = asRecord(message.source)
+            commitRoute('assistant/message', routeFromHost(this.ctx, session, this.config, { provider: source.provider, model: source.model }))
+          }
           const text = message === undefined ? '' : clamp(textOfMessage(message), this.config.capture.maxCharsPerMessage)
-          if (text === '') return
+          // Tool-only replies still prove which model received this step's user input.
+          if (text === '') { commitAssistantRoute(); return }
           const sourceEventId = stableSourceEventId(session, event, message!, 'assistant')
           const originalMessageIdentity = message === undefined ? undefined : originalMessageIdentityFor(project.key, session, event, message, 'assistant')
           if (sourceEventId !== undefined && this.sourceEventFenced(project.key, sourceEventId)) return
@@ -1115,10 +1152,7 @@ export class MemoryRuntime {
           if (captured.created && classification.process) {
             buffer.entries.push({ id: captured.id, l0Id: captured.id, role: 'assistant', content: text, createdAt: event.time ?? Date.now() })
           }
-          if (turnOf(event) === buffer.hostTurn && stepOf(event) === buffer.hostStep) {
-            const source = asRecord(message?.source)
-            commitRoute('assistant/message', routeFromHost(this.ctx, session, this.config, { provider: source.provider, model: source.model }))
-          }
+          commitAssistantRoute()
           this.trimBuffer(buffer)
           this.schedule(session.id)
           return
@@ -1214,38 +1248,45 @@ export class MemoryRuntime {
   }
 
   private wakeExtractionQueue(mode: 'schedule' | 'due' | 'release' | 'settings' = 'schedule'): void {
-    if (this.closed || this.maintenance) return
-    if (this.control.billableCallSummary().active !== undefined) {
-      for (const sessionId of this.sessions.keys()) this.schedule(sessionId)
-      return
-    }
-    if (mode !== 'schedule') {
-      const allowGateWake = mode === 'due' || mode === 'release'
-      const forceDeferred = mode === 'settings'
-      const now = Date.now()
-      const actionable: Array<{ sessionId: string; createdAt: number; dueAt: number }> = []
-      for (const [sessionId, buffer] of this.sessions) {
-        if (buffer.extracting) continue
-        const store = this.store(buffer.project)
-        const job = store.nextActionableExtractionJob(sessionId, now, allowGateWake, forceDeferred)
-        const dueAt = this.scheduledExtractionDueAt(sessionId, store, now, allowGateWake, forceDeferred)
-        if (job !== undefined && dueAt !== undefined && dueAt <= now) actionable.push({ sessionId, createdAt: job.createdAt, dueAt })
-      }
-      const next = actionable.sort((left, right) => left.dueAt - right.dueAt || left.createdAt - right.createdAt)[0]
-      if (next !== undefined) {
-        const buffer = this.sessions.get(next.sessionId)
-        if (buffer?.timer !== undefined) clearTimeout(buffer.timer)
-        if (buffer !== undefined) buffer.timer = undefined
-        void this.runExtraction(next.sessionId, forceDeferred)
+    try {
+      if (this.closed || this.maintenance) return
+      if (this.control.billableCallSummary().active !== undefined) {
+        for (const sessionId of this.sessions.keys()) this.schedule(sessionId)
         return
       }
-    }
-    for (const sessionId of this.sessions.keys()) {
-      this.schedule(sessionId)
+      if (mode !== 'schedule') {
+        const allowGateWake = mode === 'due' || mode === 'release'
+        const forceDeferred = mode === 'settings'
+        const now = Date.now()
+        const actionable: Array<{ sessionId: string; createdAt: number; dueAt: number }> = []
+        for (const [sessionId, buffer] of this.sessions) {
+          if (buffer.extracting) continue
+          const store = this.store(buffer.project)
+          const job = store.nextActionableExtractionJob(sessionId, now, allowGateWake, forceDeferred)
+          const dueAt = this.scheduledExtractionDueAt(sessionId, store, now, allowGateWake, forceDeferred)
+          if (job !== undefined && dueAt !== undefined && dueAt <= now) actionable.push({ sessionId, createdAt: job.createdAt, dueAt })
+        }
+        const next = actionable.sort((left, right) => left.dueAt - right.dueAt || left.createdAt - right.createdAt)[0]
+        if (next !== undefined) {
+          const buffer = this.sessions.get(next.sessionId)
+          if (buffer?.timer !== undefined) clearTimeout(buffer.timer)
+          if (buffer !== undefined) buffer.timer = undefined
+          void this.runExtraction(next.sessionId, forceDeferred)
+          return
+        }
+      }
+      for (const sessionId of this.sessions.keys()) this.schedule(sessionId)
+    } catch (error) {
+      this.fail(`extraction queue inspection failed: ${messageOf(error)}`)
     }
   }
 
   async runExtraction(sessionId: string, forceDeferred = false): Promise<void> {
+    try { await this.performExtraction(sessionId, forceDeferred) }
+    catch (error) { this.fail(`extraction preflight failed: ${messageOf(error)}`) }
+  }
+
+  private async performExtraction(sessionId: string, forceDeferred: boolean): Promise<void> {
     if (this.closed || this.maintenance || !this.config.generateMemory || !this.config.extraction.enabled || !this.control.isCurrentWriter()) return
     const session = this.sessionOf(sessionId)
     if (session === undefined || session.header === undefined || typeof session.header.agentPreset !== 'string' || session.header.agentPreset === '') {
@@ -1272,9 +1313,12 @@ export class MemoryRuntime {
     let job = store.nextActionableExtractionJob(sessionId, Date.now(), true, forceDeferred)
     if (job === undefined) { this.schedule(sessionId); return }
     if (job.policyRevision !== this.policyRevision()) {
-      store.updateExtractionJob(job.id, 'failed', 'policy_changed_before_dispatch')
-      this.fail('extraction paused: queued job policy changed; no model request was made')
-      return
+      const refreshed = store.refreshUndispatchedExtractionPolicy(job.id, this.policyRevision())
+      if (refreshed?.policyRevision !== this.policyRevision()) {
+        this.fail('extraction paused: previously dispatched job policy changed; its result and payment evidence are retained')
+        return
+      }
+      job = refreshed
     }
     buffer.extracting = true
     let attemptId: string | undefined
@@ -1314,7 +1358,7 @@ export class MemoryRuntime {
         this.schedule(sessionId)
         return
       }
-      let route = job.provider && job.model ? { provider: job.provider, model: job.model } : undefined
+      let route: Route | undefined = job.provider && job.model ? { provider: job.provider, model: job.model } : undefined
       if (job.status === 'queued') {
         if (route === undefined) {
           this.fail('extraction paused: no route was pinned when the source was captured; the durable job remains queued')
@@ -1332,13 +1376,19 @@ export class MemoryRuntime {
         this.fail('extraction paused: Host LLM service is unavailable; the frozen job remains ready')
         return
       }
+      if (llm.resolveModelInfo !== undefined) route = await prepareBackgroundRoute(llm, route)
+      const preparationProblem = this.extractionAcceptanceProblem(project, store, job, buffer)
+      if (preparationProblem !== undefined) { store.deferReadyExtractionJob(job.id, preparationProblem); return }
       const snapshot = job.inputSnapshot.slice(0, MAX_BATCH)
-      const conversation = formatConversation(snapshot.map((entry) => ({ ...entry, l0Id: entry.id })))
+      // Batch-local labels avoid model transcription errors in opaque source IDs.
+      // The frozen snapshot remains the authority for resolving these labels.
+      const conversation = formatConversation(snapshot.map((entry, index) => ({ ...entry, id: `l0_${index + 1}`, l0Id: entry.id })))
       if (conversation.trim() === '' || job.inputHash === undefined) throw new Error('frozen extraction input is empty or lacks a content hash')
-      const existing = this.relevantApprovedContext(project.key, store, conversation, 20)
+      const prior = this.relevantApprovedContext(project.key, store, conversation, 20)
+      const existing = prior.lines
       const reservedTokens = estimateTokens(`${conversation}\n${existing.join('\n')}\n${this.config.extraction.maxTokens}`) + this.config.extraction.maxTokens + 300
       attemptId = `att_${randomUUID().replace(/-/g, '').slice(0, 24)}`
-      const requestHash = extractionRequestIdentityHash(route, conversation, this.config.extraction.maxMemoriesPerPass, existing, this.config.extraction.maxTokens)
+      const requestHash = extractionRequestIdentityHash(route, conversation, this.config.extraction.maxMemoriesPerPass, existing, this.config.extraction.maxTokens, prior.priorPartial)
       const sourceDigest = createHash('sha256').update(job.sourceIds.join('\0')).digest('hex')
       billableCallId = this.reserveProviderCall(project.key, 'extraction', 'automatic', reservedTokens, {
         jobId: job.id, attemptId, provider: route.provider, model: route.model, requestHash,
@@ -1352,15 +1402,16 @@ export class MemoryRuntime {
       providerCallActive = true
       this.wakeExtractionQueue()
       const result = await requestExtractionDetailed(llm, route, conversation, this.config.extraction.maxMemoriesPerPass,
-        existing, this.config.extraction.maxTokens)
+        existing, this.config.extraction.maxTokens, undefined, prior.priorPartial)
       observedUsage = result.usage
       if (!this.control.isCurrentWriter()) throw new Error('writer epoch changed while the provider request was in flight; response acceptance is blocked')
       if (!result.ok) {
-        this.control.settleBillableCall(billableCallId, 'failed_known', result.usage)
+        const known = ['max-tokens', 'tool-calls', 'error'].includes(result.terminal)
+        this.control.settleBillableCall(billableCallId, known ? 'failed_known' : 'uncertain', result.usage)
         billableCallSettled = true
-        this.control.settleAttempt(attemptId, 'uncertain_remote', result.usage, result.error)
-        store.updateExtractionJob(job.id, 'uncertain_remote', `stream_${result.terminal}:${result.error ?? 'unknown'}`)
-        this.fail(`extraction result is uncertain (${result.terminal}); no automatic retry will be sent`)
+        this.control.settleAttempt(attemptId, known ? 'failed_known' : 'uncertain_remote', result.usage, result.error)
+        store.updateExtractionJob(job.id, known ? 'failed' : 'uncertain_remote', `stream_${result.terminal}:${result.error ?? 'unknown'};text_chars=${result.text.length}`)
+        this.fail(`extraction ${known ? 'failed' : 'result is uncertain'} (${result.terminal}); no automatic retry will be sent`)
         return
       }
       const postResponseSourceProblem = this.sourceEligibilityProblem(project.key, store, job.sourceIds)
@@ -1447,6 +1498,10 @@ export class MemoryRuntime {
         return
       }
       const allowedSources = new Set(job.sourceIds)
+      const labels = new Map(job.inputSnapshot.slice(0, MAX_BATCH).map((entry, index) => [`l0_${index + 1}`, entry.id]))
+      for (const memory of parsed.memories) {
+        memory.sourceMessageIds = [...new Set(memory.sourceMessageIds.map((id) => labels.get(id) ?? id))]
+      }
       if (parsed.memories.some((memory) => memory.sourceMessageIds.length === 0 || memory.sourceMessageIds.some((id) => !allowedSources.has(id)) || !store.hasSourceMessages(memory.sourceMessageIds))) {
         store.updateExtractionJob(job.id, 'failed', 'source_validation_failed')
         const callId = job.attemptId === undefined ? undefined : this.control.getAttempt(job.attemptId)?.billableCallId
@@ -1520,7 +1575,7 @@ export class MemoryRuntime {
   }
 
   private statusFor(confidence: number): 'candidate' | 'approved' {
-    // Demo v7 no longer requires a manual approval UI; uncertainty remains non-injectable.
+    // Only confident results activate automatically; uncertainty remains pending review.
     return Number.isFinite(confidence) && confidence >= this.config.autoApproveConfidence ? 'approved' : 'candidate'
   }
 
@@ -1569,7 +1624,7 @@ export class MemoryRuntime {
     const readIds = new Set<string>(), cursors = new Set<string>()
     let stopped: string | undefined
     observe?.('scan-tokenize')
-    const candidates: RoutedSearchHit[] = [], terms = tokenize(query).slice(0, 32)
+    const candidates: RoutedSearchHit[] = [], terms = recallQueryTerms(query)
     try {
       let page: ReadDashboardResult = observeGlobalRecallRead<ReadDashboardResult>(observe, 'scan-read', (): ReadDashboardResult => this.readDashboard({ version: 1, action: 'global', layer: 'L1', query: query.slice(0, 200), relationDepth, ...(scanCursor === undefined ? {} : { resume: scanCursor }), year: new Date().getUTCFullYear(), timeZone: 'UTC' }))
       for (let round = 0; round < 17; round += 1) {
@@ -1579,7 +1634,7 @@ export class MemoryRuntime {
           const memory = item.memory
           if (memory === undefined) continue
           const text = memory.content.toLocaleLowerCase()
-          const matches = terms.filter((term) => text.includes(term.toLocaleLowerCase())).length
+          const matches = terms.filter((term) => recallTermMatches(text, term)).length
           const routes = item.routes ?? ['profile_lexical'], relation = routes.includes('relation')
           const score = item.score ?? (terms.length === 0 ? 0 : matches / terms.length)
           if (!relation && score < this.config.recall.minScore) continue
@@ -1617,7 +1672,9 @@ export class MemoryRuntime {
     } catch { /* diagnostics must never change recall or cleanup behavior */ }
   }
 
-  globalRecall(userText: string, session: SessionLike): string | undefined {
+  globalRecall(userText: string, session: SessionLike, reservedTokens = 0): string | undefined {
+    const reserved = Number.isSafeInteger(reservedTokens) ? Math.max(0, Math.min(200, Math.floor(reservedTokens))) : 0
+    const effectiveMaxTokens = Math.max(40, this.config.recall.maxTokens - reserved)
     const diagnostic: GlobalRecallDiagnostic = { stage: 'admission', reason: 'pending', scanWindows: 0,
       candidateCount: 0, selectedCount: 0, elapsedMs: 0 }
     if (!this.memoryUseAllowed(session) || this.closed || this.maintenance) {
@@ -1678,12 +1735,12 @@ export class MemoryRuntime {
         return [{ record, score: record.score }]
       })
       const packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits,
-        maxTokens: this.config.recall.maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
+        maxTokens: effectiveMaxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
       const selected = new Set(packet.selected)
       diagnostic.selectedCount = selected.size
       if (hits.length === 0) observe('packing', 'no-candidates')
       else if (selected.size === 0) observe('packing', 'no-selection')
-      const result = this.proveGlobalRecall(hits.filter((hit) => selected.has(hit.record.id)), query, session, partial, canContinue, observe)
+      const result = this.proveGlobalRecall(hits.filter((hit) => selected.has(hit.record.id)), query, session, partial, canContinue, observe, effectiveMaxTokens)
       if (result !== undefined) observe('complete', 'injected')
       return result
     } catch {
@@ -1697,8 +1754,7 @@ export class MemoryRuntime {
   }
 
   private proveGlobalRecall(hits: RecallHit[], query: string, session: SessionLike, partial: boolean,
-    canContinue: () => boolean, observe?: GlobalRecallObserver): string | undefined {
-    if (hits.length === 0) return undefined
+    canContinue: () => boolean, observe?: GlobalRecallObserver, maxTokens = this.config.recall.maxTokens): string | undefined {
     observe?.('proof-admission')
     if (!canContinue()) return undefined
     const root = realpathSync(this.stateRoot), policy = this.policyRevision()
@@ -1793,8 +1849,14 @@ export class MemoryRuntime {
         }
       }
       observe?.('packing')
-      const packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits: proven,
-        maxTokens: this.config.recall.maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
+      // The persona body is never a cached string: it is re-derived from the
+      // current project persona (or the opt-in global persona) here, with its
+      // approved sources, revisions and forget/revocation fences re-checked at
+      // this moment. Budget-omitted or missing persona never suppresses facts.
+      let persona = this.activeRoutePersona(session)
+      let packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits: proven,
+        ...(persona === undefined ? {} : { personaContent: persona.content }),
+        maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
       // Every proof session remains live until ALL selected bodies have been resolved and packed.
       // Re-probe the earlier sessions after later reads, including their dependency TTL and fences.
       for (const reader of readers) {
@@ -1808,11 +1870,141 @@ export class MemoryRuntime {
         if (published.status !== 'ok') return undefined
       }
       if (!currentScope()) { observe?.('proof-publication', 'scope-unavailable'); return undefined }
+      if (persona !== undefined && !this.personaSourcesProven(persona.sources)) {
+        // A persona whose sources changed between packing and publication is
+        // dropped; the already proved facts still publish.
+        persona = undefined
+        packet = buildRecallContext({ projectName: partial ? '全局记忆（已读取部分）' : '全局记忆', hits: proven,
+          maxTokens, maxChars: this.config.recall.maxChars, maxResults: this.config.recall.maxResults })
+        observe?.('packing', 'persona-invalidated-before-publication')
+      }
       if (packet.text === undefined) observe?.('packing', 'no-visible-candidates')
       return packet.text
     } finally {
       for (const reader of readers) reader.cancel()
     }
+  }
+
+  /**
+   * The bounded user profile eligible for the active recall route: the current
+   * project persona when readable and source-proved, otherwise the opt-in
+   * global persona (whose own read re-checks every source). Returns live
+   * proof metadata so the caller can re-prove sources at publication time.
+   */
+  private activeRoutePersona(session: SessionLike): { content: string; sources: Array<{ projectKey: string; id: string; revision: number }> } | undefined {
+    if (!this.config.recall.includePersona) return undefined
+    try {
+      const cwd = sessionCwd(session, this.stateRoot)
+      if (cwd !== undefined) {
+        const project = projectIdentity(cwd)
+        // Never this.store(project): that re-writes project meta, and a mid-read
+        // write invalidates the recall publication proofs. Read-only access only.
+        if (existsSync(projectDbPath(this.stateRoot, project.key))) {
+          const store = openProjectStoreReadOnly(this.stateRoot, project.key)
+          try {
+            const localPersona = store.persona()
+            if (localPersona !== null && !localPersona.stale && this.localPersonaReadable(project.key, store, localPersona)) {
+              const sources = (localPersona.sourceIds ?? []).map((id) => ({ projectKey: project.key, id, revision: localPersona.sourceRevisions?.[id] ?? 0 }))
+              if (sources.length > 0) return { content: localPersona.content, sources }
+            }
+          } finally { store.close() }
+        }
+      }
+      if (this.config.persona.global) {
+        const global = this.globalPersona(true)
+        if (global === null || global.stale === true) return undefined
+        return { content: global.content, sources: global.sourceRefs }
+      }
+    } catch { return undefined }
+    return undefined
+  }
+
+  private personaSourcesProven(sources: Array<{ projectKey: string; id: string; revision: number }>): boolean {
+    if (sources.length === 0 || sources.length > 300) return false
+    const stores = new Map<string, MemoryStore>()
+    try {
+      for (const source of sources) {
+        let store = stores.get(source.projectKey)
+        if (!store) { store = openProjectStoreReadOnly(this.stateRoot, source.projectKey); stores.set(source.projectKey, store) }
+        const record = this.readableMemory(source.projectKey, store, source.id)
+        if (record === undefined || record.revision !== source.revision) return false
+      }
+      return true
+    } catch { return false }
+    finally { for (const store of stores.values()) store.close() }
+  }
+
+  /**
+   * Bounded, opt-in character guidance for one Host session: the stable base
+   * description plus learned communication preferences. It respects the same
+   * use gates as recall (use off keeps it out of conversations), reads only
+   * current readable records, and never calls a model.
+   */
+  /** Reserve at most half the packet for learned expression; re-read its proof after fact recall. */
+  characterReservation(session: SessionLike | undefined): number {
+    if (!this.memoryUseAllowed(session) || this.closed || this.maintenance || !this.config.character.enabled) return 0
+    try {
+      const learned = this.learnedCommunicationPreferences()
+      if (learned.length === 0) return 0
+      const formatted = formatCharacterGuidance({
+        description: this.config.character.description.trim() || DEFAULT_CHARACTER_DESCRIPTION, learned,
+        maxTokens: Math.min(160, Math.floor((this.config.recall.maxTokens - 1) / 2)),
+        ...(this.config.recall.maxChars > 0 ? { maxChars: Math.floor(this.config.recall.maxChars / 2) } : {}),
+      })
+      return formatted === undefined ? 0 : formatted.usedTokens + 1
+    } catch { return 0 }
+  }
+
+  characterGuidance(session: SessionLike | undefined, maxTokens = this.config.recall.maxTokens / 2, maxChars?: number): string | undefined {
+    if (!this.memoryUseAllowed(session) || this.closed || this.maintenance) return undefined
+    if (!this.config.character.enabled) return undefined
+    try {
+      const description = this.config.character.description.trim() === ''
+        ? DEFAULT_CHARACTER_DESCRIPTION
+        : this.config.character.description.trim()
+      const learned = this.learnedCommunicationPreferences()
+      const formatted = formatCharacterGuidance({
+        description,
+        learned,
+        maxTokens: Math.min(160, Math.floor(maxTokens)),
+        ...(maxChars === undefined ? {} : { maxChars }),
+      })
+      return formatted?.text
+    } catch { return undefined }
+  }
+
+  /**
+   * Source-backed communication preferences learned across this profile.
+   * The bounded project enumeration is the same one ordinary profile browse
+   * uses; each candidate must pass the current readable-memory check, and its
+   * cited L0 sources must contain at least one real user message, so
+   * assistant-only prose, forgotten/revoked records and other profiles never
+   * become learned style evidence.
+   */
+  private learnedCommunicationPreferences(): LearnedStylePreference[] {
+    const learned: Array<LearnedStylePreference & { dimension: string }> = []
+    let enumeration: { keys: string[]; complete: boolean }
+    try { enumeration = profileSources(this.stateRoot) } catch { return learned }
+    for (const key of enumeration.keys) {
+      let store: MemoryStore
+      try { store = openProjectStoreReadOnly(this.stateRoot, key) } catch { continue }
+      try {
+        for (const record of store.approvedSceneRecords(COMMUNICATION_STYLE_SCENE, MAX_STYLE_SCAN_PER_PROJECT)) {
+          const current = this.readableMemory(key, store, record.id)
+          if (current === undefined) continue
+          const preferences = explicitCommunicationPreferences(store.userStyleEvidence(current.sourceMessageIds))
+          if (this.readableMemory(key, store, current.id)?.revision !== current.revision) continue
+          for (const preference of preferences) learned.push({ projectKey: key, projectName: this.projects.get(key)?.name ?? key,
+            id: globalMemoryKey(key, current.id), revision: current.revision, ...preference, updatedAt: current.updatedAt })
+        }
+      } catch { /* an unreadable store contributes nothing; other projects stay eligible */ }
+      finally { store.close() }
+    }
+    const dimensions = new Set<string>()
+    return learned.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id)).filter((item) => {
+      if (dimensions.has(item.dimension)) return false
+      dimensions.add(item.dimension); return true
+    }).slice(0, MAX_STYLE_ITEMS)
   }
 
   recall(cwd: string, userText: string, sessionId?: string, options: RecallQueryOptions = {}): RecallHit[] {
@@ -2602,6 +2794,10 @@ export class MemoryRuntime {
     globalPersona?: boolean
     extractionEveryN?: number
     extractionEnabled?: boolean
+    extractionProvider?: string
+    extractionModel?: string
+    characterEnabled?: boolean
+    characterDescription?: string
     /** @deprecated Old daily quota inputs are ignored, never persisted or returned. */
     automaticDailyTokens?: number
     automaticDailyTasks?: number
@@ -2609,6 +2805,12 @@ export class MemoryRuntime {
     manualDailyTasks?: number
   }): void {
     if (this.maintenance) throw new Error('settings are paused while memory recovery maintenance is active')
+    const routeChanged = patch.extractionProvider !== undefined || patch.extractionModel !== undefined
+    if (routeChanged && (typeof patch.extractionProvider !== 'string' || typeof patch.extractionModel !== 'string' ||
+        patch.extractionProvider.length > 160 || patch.extractionModel.length > 240 ||
+        !!patch.extractionProvider.trim() !== !!patch.extractionModel.trim())) {
+      throw new Error('background provider and model must be supplied together, or both cleared')
+    }
     const previous = JSON.parse(JSON.stringify(this.config)) as ResolvedConfig
     if (typeof patch.generateMemory === 'boolean' && patch.generateMemory !== this.config.generateMemory) {
       this.generationEpoch += 1
@@ -2632,7 +2834,15 @@ export class MemoryRuntime {
     }
     if (typeof patch.extractionEnabled === 'boolean') {
       this.config.extraction.enabled = patch.extractionEnabled
-
+    }
+    if (routeChanged) {
+      this.config.extraction.provider = patch.extractionProvider!.trim() || undefined
+      this.config.extraction.model = patch.extractionModel!.trim() || undefined
+    }
+    if (typeof patch.characterEnabled === 'boolean') this.config.character.enabled = patch.characterEnabled
+    if (typeof patch.characterDescription === 'string') {
+      const description = patch.characterDescription.trim()
+      this.config.character.description = description === '' ? '' : description.slice(0, 400)
     }
     try { this.persistSettings() } catch (error) {
       Object.assign(this.config, previous)
@@ -2899,6 +3109,10 @@ export class MemoryRuntime {
           globalPersona: this.config.persona.global,
           extractionEveryN: this.config.extraction.everyNConversations,
           extractionEnabled: this.config.extraction.enabled,
+          extractionProvider: this.config.extraction.provider ?? '',
+          extractionModel: this.config.extraction.model ?? '',
+          characterEnabled: this.config.character.enabled,
+          characterDescription: this.config.character.description,
         }, null, 2)}\n`,
       )
     } catch (error) {
@@ -3213,6 +3427,8 @@ export class MemoryRuntime {
         extractionEveryN: this.config.extraction.everyNConversations,
         autoApproveConfidence: this.config.autoApproveConfidence,
         extractionEnabled: this.config.extraction.enabled,
+        characterEnabled: this.config.character.enabled,
+        characterDescription: this.config.character.description,
       },
       ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
     }
@@ -4263,6 +4479,7 @@ export class MemoryRuntime {
   private sourcePermissionRevoked(projectKey: string, store: MemoryStore, sourceId: string): boolean {
     if (this.control.isSourceIdRevoked(projectKey, sourceId)) return true
     const identity = store.sourceIdentity(sourceId)
+    if (identity !== undefined && !isConversationSource(identity.sourceKind)) return true
     return identity?.sourceEventId !== undefined && this.sourceEventFenced(projectKey, identity.sourceEventId)
   }
 
@@ -4605,23 +4822,61 @@ export class MemoryRuntime {
     return { candidates, routeCounts, gaps: [...new Set(gaps)].slice(0, 20), scanCapped, temporal: temporalSnapshot !== undefined, stopReason }
   }
 
-  private relevantApprovedContext(projectKey: string, store: MemoryStore, conversation: string, limit: number): string[] {
+  /**
+   * Bounded prior-evidence block for one extraction pass.
+   *
+   * Ordinary recall reads the whole profile, so the extractor must not see
+   * only the current project: an approved preference learned in project A has
+   * to be visible when project B states a correction. The profile scan reuses
+   * the existing bounded `profileSources` enumeration and per-term store
+   * searches; it is capped, and any cap, unreadable store, or incomplete
+   * enumeration is reported through `priorPartial` so the prompt can never
+   * claim "no conflict exists" after a partial read. No model call is made.
+   */
+  private relevantApprovedContext(projectKey: string, store: MemoryStore, conversation: string, limit: number): { lines: string[]; priorPartial: boolean } {
     const terms = [...new Set(tokenize(conversation).map((term) => term.toLocaleLowerCase()).filter((term) => term.length > 1))].slice(0, 16)
-    if (terms.length === 0) return []
-    const candidates = new Map<string, SearchHit>()
+    if (terms.length === 0) return { lines: [], priorPartial: false }
+    const candidates = new Map<string, { record: MemoryRecord; score: number; identity: string }>()
     for (const term of terms) {
       for (const hit of store.search(term, Math.max(20, limit * 4), this.config.capture.excludeAgents)) {
         const current = this.readableMemory(projectKey, store, hit.id)
-        if (current !== undefined) candidates.set(hit.id, { ...current, score: hit.score })
+        if (current !== undefined) candidates.set(current.id, { record: current, score: hit.score, identity: `${current.id}@r${current.revision}` })
       }
     }
-    return [...candidates.values()].map((record) => {
-      const text = record.content.toLocaleLowerCase()
+    let priorPartial = false
+    let keys: string[] = []
+    try {
+      const enumeration = profileSources(this.stateRoot)
+      priorPartial ||= !enumeration.complete
+      keys = enumeration.keys.filter((key) => key !== projectKey)
+      if (keys.length > MAX_PRIOR_PROJECTS) { keys = keys.slice(0, MAX_PRIOR_PROJECTS); priorPartial = true }
+    } catch { priorPartial = true }
+    for (const key of keys) {
+      const cached = this.stores.get(key)
+      let otherStore: MemoryStore
+      try { otherStore = cached ?? openProjectStoreReadOnly(this.stateRoot, key) } catch { priorPartial = true; continue }
+      try {
+        for (const term of terms) {
+          for (const hit of otherStore.search(term, 20, this.config.capture.excludeAgents)) {
+            const current = this.readableMemory(key, otherStore, hit.id)
+            if (current === undefined) continue
+            const globalKey = globalMemoryKey(key, current.id)
+            if (candidates.has(globalKey)) continue
+            candidates.set(globalKey, { record: current, score: hit.score, identity: `${globalKey}@r${current.revision}` })
+          }
+        }
+      } catch { priorPartial = true }
+      finally { if (cached === undefined) otherStore.close() }
+    }
+    if (candidates.size > limit) priorPartial = true
+    const lines = [...candidates.values()].map((entry) => {
+      const text = entry.record.content.toLocaleLowerCase()
       const matched = terms.filter((term) => text.includes(term)).length
-      const score = matched / terms.length + (record.kind === 'decision' || record.kind === 'preference' ? 0.02 : 0)
-      return { record, score }
-    }).filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score || b.record.updatedAt - a.record.updatedAt || a.record.id.localeCompare(b.record.id))
-      .slice(0, Math.max(0, Math.min(100, Math.floor(limit)))).map(({ record }) => `${record.id}@r${record.revision}: ${record.content}`)
+      const score = matched / terms.length + (entry.record.kind === "decision" || entry.record.kind === "preference" ? 0.02 : 0)
+      return { entry, score }
+    }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || b.entry.record.updatedAt - a.entry.record.updatedAt || a.entry.identity.localeCompare(b.entry.identity))
+      .slice(0, Math.max(0, Math.min(100, Math.floor(limit)))).map(({ entry }) => `${entry.identity}: ${entry.record.content}`)
+    return { lines, priorPartial }
   }
 
   private projectForKey(projectKey: string): ProjectIdentity {
@@ -5135,6 +5390,8 @@ export class MemoryRuntime {
       globalPersona: this.config.persona.global && snapshot.globalPersona !== false,
       extractionEnabled: this.config.extraction.enabled && snapshot.extractionEnabled !== false,
       extractionEveryN: Math.max(this.config.extraction.everyNConversations, Math.max(1, numberOr(snapshot.extractionEveryN, this.config.extraction.everyNConversations))),
+      characterEnabled: this.config.character.enabled && snapshot.characterEnabled !== false,
+      characterDescription: typeof snapshot.characterDescription === 'string' ? snapshot.characterDescription.trim().slice(0, 400) : this.config.character.description,
     }
     writeFileSync(file, `${JSON.stringify(setting, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   }
@@ -5440,21 +5697,22 @@ export class MemoryRuntime {
     }
   }
 
-  private forgetV7(projectKey: string, payload: Record<string, unknown>): { applied: boolean } {
+  private reviewV7(projectKey: string, payload: Record<string, unknown>, action: 'approve' | 'forget'): { applied: boolean } {
     if (payload.layer !== 'L1' || payload.confirmed !== true || typeof payload.id !== 'string' || Buffer.byteLength(payload.id) > 256 ||
-        !Number.isSafeInteger(payload.updatedAt)) throw new Error('L1 forget confirmation invalid')
-    if (this.closed || this.maintenance || !this.control.isCurrentWriter()) throw new Error('forget unavailable')
+        !Number.isSafeInteger(payload.updatedAt) || action === 'approve' && (!Number.isSafeInteger(payload.revision) || Number(payload.revision) < 1)) throw new Error(`L1 ${action} confirmation invalid`)
+    if (this.closed || this.maintenance || !this.control.isCurrentWriter()) throw new Error(`${action} unavailable`)
     const store = this.storeByKey(projectKey, false), id = payload.id
-    const record = this.readableMemory(projectKey, store, id)
-    if (record === undefined || record.updatedAt !== payload.updatedAt) throw new Error('memory changed')
+    const record = action === 'approve' || store.statusOf(id) === 'candidate' ? store.get(id) : this.readableMemory(projectKey, store, id)
+    if (record === undefined || record.updatedAt !== payload.updatedAt || payload.revision !== undefined && payload.revision !== record.revision) throw new Error('memory changed')
     this.invalidateDashboardVisibilityReaders()
-    this.dashboardReadSessions.invalidate('global-forget')
-    this.review(projectKey, id, 'forget')
-    return { applied: this.control.isForgotten(projectKey, id) }
+    this.dashboardReadSessions.invalidate(`global-${action}`)
+    const outcome = this.reviewOutcome(projectKey, id, action)
+    if (!outcome.ok) throw new Error(outcome.reason ?? 'review rejected')
+    return { applied: action === 'forget' ? this.control.isForgotten(projectKey, id) : store.statusOf(id) === 'approved' }
   }
 
   async manageProjectOperation(projectKey: string, operation: string, payload: Record<string, unknown> = {}): Promise<unknown> {
-    if (operation === 'v7.forget') return this.forgetV7(projectKey, payload)
+    if (operation === 'v7.forget' || operation === 'v7.approve') return this.reviewV7(projectKey, payload, operation === 'v7.forget' ? 'forget' : 'approve')
     if (this.maintenance && !['recovery.list', 'recovery.plan'].includes(operation)) {
       throw new Error('management writes and project reads are paused during recovery maintenance')
     }
@@ -5714,6 +5972,51 @@ export class MemoryRuntime {
           from: days[0]!.from, to: days[days.length - 1]!.to, after,
           limit: Math.max(1, Math.min(100, Math.floor(num('limit', 50)))), excludedAgentPatterns: this.config.capture.excludeAgents,
         })
+      }
+      case 'processing.recover': {
+        if (this.closed || !this.control.isCurrentWriter()) throw new Error('recovery requires the active memory writer')
+        if (payload.authorized !== true) throw new Error('explicit recovery authorization is required; this can issue a new paid request')
+        const store = this.storeByKey(projectKey, false), id = str('id'), reason = str('reason')
+        const prior = store.extractionRetry(id)
+        if (prior) return { job: prior, reused: true }
+        let job = store.getExtractionJob(id)
+        if (!job) throw new Error('extraction job not found')
+        const attempt = job.attemptId ? this.control.getAttempt(job.attemptId) : undefined
+        const call = attempt?.billableCallId ? this.control.getBillableCall(attempt.billableCallId) : undefined
+        if (job.status === 'uncertain_remote' && job.error?.startsWith('stream_max-tokens:') &&
+            attempt?.jobId === id && call?.jobId === id && call.attemptId === attempt.id && call.state === 'failed_known' &&
+            attempt.state === 'uncertain_remote') {
+          this.control.settleAttempt(attempt.id, 'failed_known', undefined, 'reconciled_known_max_tokens')
+          store.updateExtractionJob(id, 'failed', job.error)
+          job = store.getExtractionJob(id)!
+        }
+        const currentAttempt = job.attemptId ? this.control.getAttempt(job.attemptId) : undefined
+        if (['uncertain_remote', 'dispatching', 'blocked_charged'].includes(job.status) || call?.state === 'uncertain' ||
+            currentAttempt && ['uncertain_remote', 'dispatching', 'blocked_charged'].includes(currentAttempt.state)) {
+          throw new Error('provider outcome is unknown or unresolved; recovery cannot redispatch it')
+        }
+        if (job.status === 'source_pruned') return { job, retired: true }
+        if (!['queued', 'failed'].includes(job.status)) throw new Error('only failed or unsent jobs can be recovered')
+        const sourceIds = store.sourceMessages(job.sourceIds).filter(source =>
+          isConversationSource(source.sourceKind, source.role) &&
+          !this.control.isContentDeleted(projectKey, 'source', source.id) &&
+          !this.sourcePermissionRevoked(projectKey, store, source.id)).map(source => source.id)
+        if (sourceIds.length === 0) {
+          store.updateExtractionJob(id, 'source_pruned', `no_eligible_sources:${job.error ?? reason}`)
+          return { job: store.getExtractionJob(id), retired: true }
+        }
+        // A deliberate recovery may select a working model without rewriting the paid original route.
+        const requestedProvider = str('provider', true), requestedModel = str('model', true)
+        if (!!requestedProvider !== !!requestedModel) throw new Error('recovery provider and model must be supplied together')
+        const provider = requestedProvider || job.provider, model = requestedModel || job.model
+        if (!provider || !model) throw new Error('recovery route is missing; supply a verified provider and model explicitly')
+        if (provider.length > 160 || model.length > 240 || reason.length > 500) throw new Error('recovery route or reason exceeds its limit')
+        const live = this.sessionOf(job.sessionId), cwd = live && sessionCwd(live, this.stateRoot)
+        if (!live || !cwd || projectIdentity(cwd).key !== projectKey || this.isAgentExcluded(live)) throw new Error('original Host session is unavailable or excluded')
+        if (!this.config.generateMemory || !this.config.extraction.enabled) throw new Error('memory generation or extraction is disabled')
+        const next = store.createExtractionRetry(id, { sourceIds, provider, model, policyRevision: this.policyRevision(), reason })
+        await this.runExtraction(next.sessionId)
+        return { job: store.getExtractionJob(next.id), reused: false }
       }
       case 'processing.jobs': {
         const afterRaw = payload.after
@@ -5988,10 +6291,12 @@ export class MemoryRuntime {
   }
 
   private async requestBillableText(projectKey: string, purpose: string, messages: Array<{ role: string; content: unknown }>, maxTokens: number,
-    operation: BillableResultOperation): Promise<{ callId: string; text: string }> {
+    operation: Exclude<BillableResultOperation, { kind: 'extraction' }>): Promise<{ callId: string; text: string }> {
     const llm = llmOf(this.ctx)
-    const route = routeFromHost(this.ctx, undefined, this.config)
+    let route = routeFromHost(this.ctx, undefined, this.config)
     if (llm === undefined || route === undefined) throw new Error('no LLM route available for billable memory operation')
+    if (llm.resolveModelInfo !== undefined) route = await prepareBackgroundRoute(llm, route)
+    if (operation.policyRevision !== this.policyRevision() || this.personaOperationHasCurrentFence(operation)) throw new Error('memory sources or settings changed before provider dispatch')
     const reservedTokens = estimateTokens(JSON.stringify(messages)) + maxTokens + 300
     const requestHash = requestIdentityHash(route, messages, maxTokens)
     const callId = this.reserveProviderCall(projectKey, purpose, 'manual', reservedTokens,

@@ -5,10 +5,11 @@
  * directory member connections are opened by the owning runtime through the
  * injected `openDirectoryMember` callback and released with their handle.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID, type Hash } from 'node:crypto'
 import { lstatSync } from 'node:fs'
 import path from 'node:path'
 import { matchesAgentGlob } from './config.js'
+import { isConversationSource } from './r41.js'
 import type { ControlLedger, DashboardVisibilityFences } from './control.js'
 import type {
   DashboardReadBinding, DashboardReadCost, DashboardReadFailureStatus,
@@ -645,6 +646,11 @@ export class DashboardVisibilityReadSession {
   private readonly memo = new Map<string, NodeProof>()
   private readonly memoReservations: string[] = []
   private memoProofStateLost = false
+  // Constant-size proof of a streamed derived index. The same native connection
+  // probes stay alive across every batch; no body or unbounded ID set is retained.
+  private derivedProof?: { token: string; projectKey: string; layer: 'L2' | 'L3'; identity: string;
+    count: number; ordinal?: number; digest: Hash }
+  private provenExpiryAt?: number
   private readonly managedPageContinuations = new Map<string, ManagedPageContinuation>()
   private readonly managedProofContinuations = new Map<string, ManagedPageItemProgress>()
   private readonly managedPageLeaseTokens = new Set<string>()
@@ -1263,7 +1269,7 @@ export class DashboardVisibilityReadSession {
     const store = this.stores.get(projectKey)
     if (store === undefined) return this.failure('unavailable-probe', 'visibility-project-store-missing')
     return this.run(store, { sqlStatements: 1, rowsVisited: 1, materializedBytes: maxBytes + 64,
-      keyBytes: this.keyBytes(projectKey, name) + maxBytes }, () => store.dashboardSceneSummary(name, maxBytes),
+      keyBytes: this.keyBytes(projectKey, name) }, () => store.dashboardSceneSummary(name, maxBytes),
     JSON.stringify(['scene-summary', projectKey, name, maxBytes]))
   }
 
@@ -1294,6 +1300,41 @@ export class DashboardVisibilityReadSession {
   }
 
   /** Full root proof for one normalized scene member at the recorded revision. */
+  beginManagedDerivedProof(projectKey: string, layer: 'L2' | 'L3', identity: string): DashboardReadOutcome<string> {
+    if (this.binding.viewKey !== 'memory.global.v7' || !this.isBoundProject(projectKey) || this.derivedProof !== undefined) {
+      return this.failure('stale', 'derived-proof-scope-invalid')
+    }
+    this.derivedProof = { token: randomUUID(), projectKey, layer, identity, count: 0, digest: createHash('sha256') }
+    return { status: 'ok', value: this.derivedProof.token }
+  }
+
+  /** Compact a completed root/dependency proof under the still-live native version fence. */
+  commitManagedDerivedMember(token: string, member: DashboardSceneMemberRow): DashboardReadOutcome<void> {
+    const progress = this.derivedProof
+    if (this.ended || this.paused || progress?.token !== token || !isValidDashboardSceneMember(member) ||
+        progress.ordinal !== undefined && member.ordinal <= progress.ordinal) return this.failure('stale', 'derived-member-order-invalid')
+    const proof = this.memo.get(this.memoKey(progress.projectKey, member.memoryId))
+    const now = this.readWallNow()
+    if (now === undefined || this.memoHasExpired(now) || proof?.state !== 'visible' || proof.revision !== member.revision) {
+      return this.failure('stale', 'derived-member-not-proven')
+    }
+    this.provenExpiryAt = this.earliestVisibleExpiry()
+    progress.digest.update(`${member.memoryId}\0${member.revision}\0${member.ordinal}\n`, 'utf8')
+    progress.count += 1; progress.ordinal = member.ordinal
+    this.discardMemo()
+    return { status: 'ok', value: undefined }
+  }
+
+  managedDerivedDigest(token: string): DashboardReadOutcome<{ count: number; digest: string }> {
+    const progress = this.derivedProof
+    return progress?.token === token ? { status: 'ok', value: { count: progress.count, digest: progress.digest.copy().digest('hex') } } :
+      this.failure('stale', 'derived-proof-missing')
+  }
+
+  finishManagedDerivedProof(token: string): void {
+    if (this.derivedProof?.token === token) this.derivedProof = undefined
+  }
+
   proveManagedSceneMember(projectKey: string, id: string, revision: number): DashboardReadOutcome<'visible' | 'hidden' | 'unresolved'> {
     if (!this.isBoundProject(projectKey) || !this.validId(id) || !Number.isSafeInteger(revision) || revision < 1) {
       return this.failure('unavailable-probe', 'scene-member-invalid')
@@ -1317,7 +1358,7 @@ export class DashboardVisibilityReadSession {
 
   /** Re-read the whole scene identity/digest/summary; only then may a summary leave the reader. */
   readManagedSceneFinal(projectKey: string, expected: { name: string; memoryCount: number; updatedAt: number;
-    summaryBytes: number; summaryComplete: boolean; memberCount: number; memberDigest: string }):
+    summaryBytes: number; summaryComplete: boolean; memberCount: number; memberDigest: string; proofToken?: string }):
     DashboardReadOutcome<{ state: 'visible' | 'hidden' | 'unresolved'; reason?: string; summary?: string; summaryComplete?: boolean }> {
     if (!this.isBoundProject(projectKey) || typeof expected.name !== 'string' || expected.name.length === 0 ||
         Buffer.byteLength(expected.name, 'utf8') > 512 || !Number.isSafeInteger(expected.memoryCount) || expected.memoryCount < 0 ||
@@ -1348,6 +1389,12 @@ export class DashboardVisibilityReadSession {
       return { status: 'ok', value: { state: 'unresolved', reason: 'scene-identity-changed' } }
     }
     if (!row.frontierReady) return { status: 'ok', value: { state: 'unresolved', reason: 'scene-frontier-not-ready' } }
+    const stream = this.derivedProof
+    if (expected.proofToken !== undefined && (stream?.token !== expected.proofToken || stream.layer !== 'L2' ||
+        stream.projectKey !== projectKey || stream.identity !== JSON.stringify([expected.name, expected.memoryCount, expected.updatedAt,
+          expected.summaryBytes, expected.summaryComplete]) || stream.count !== expected.memberCount || stream.count !== expected.memoryCount ||
+        stream.digest.copy().digest('hex') !== expected.memberDigest)) return this.failure('stale', 'scene-stream-proof-invalid')
+    if (expected.proofToken === undefined) {
     const members: DashboardSceneMemberRow[] = []
     let afterOrdinal: number | undefined
     let hasMore = true
@@ -1391,9 +1438,8 @@ export class DashboardVisibilityReadSession {
         return { status: 'ok', value: { state: 'unresolved', reason: 'scene-members-not-proven' } }
       }
     }
-    // The SQL projection and temporary-key charge are bounded by the exact
-    // metadata summary size, not the full 64 KiB response maximum. A short
-    // summary therefore fits the default per-call key budget.
+    }
+    // Materialize the exact summary bytes; only project/name are lookup keys.
     const summary = this.readManagedSceneSummary(projectKey, expected.name, expected.summaryBytes)
     if (summary.status !== 'ok') return summary
     const summaryText = summary.value.summary
@@ -1408,7 +1454,7 @@ export class DashboardVisibilityReadSession {
   }
 
   /** Bind a bounded persona plan; the caller stores only this identity and source list. */
-  readManagedPersonaPlan(projectKey: string): DashboardReadOutcome<{
+  readManagedPersonaPlan(projectKey: string, streaming = false): DashboardReadOutcome<{
     state: 'visible' | 'unresolved' | 'hidden'; reason?: string; sourceIds?: string[]; sourceRevisions?: Record<string, number>;
     contentBytes?: number; sourceCount?: number; updatedAt?: number; stale?: boolean
   }> {
@@ -1423,6 +1469,12 @@ export class DashboardVisibilityReadSession {
     if (meta.status !== 'ok') return meta
     if (meta.value === undefined) return { status: 'ok', value: { state: 'hidden', reason: 'persona-not-found' } }
     const m = meta.value
+    if (!safeInteger(m.sourceCount) || m.sourceCount !== m.sourceArrayCount || !safeInteger(m.updatedAt) ||
+        !safeInteger(m.contentBytes) || m.contentBytes > 65_536) {
+      return { status: 'ok', value: { state: 'unresolved', reason: 'persona-source-incomplete' } }
+    }
+    if (streaming) return { status: 'ok', value: { state: 'visible', sourceIds: [], sourceRevisions: {},
+      contentBytes: m.contentBytes, sourceCount: m.sourceCount, updatedAt: m.updatedAt, stale: m.sourceCount === 0 } }
     if (m.contentBytes > 65_536 || m.sourceIdsBytes > 16_384 || m.sourceRevisionsBytes > 16_384 || m.sourceCount > 100) {
       return { status: 'ok', value: { state: 'unresolved', reason: 'persona-proof-over-budget' } }
     }
@@ -1456,6 +1508,17 @@ export class DashboardVisibilityReadSession {
   }
 
   /** Full root proof for one persisted persona source; the aggregate owns the next index. */
+  readManagedPersonaSourcePage(projectKey: string, afterOrdinal?: number): DashboardReadOutcome<{
+    rows: DashboardSceneMemberRow[]; hasMore: boolean }> {
+    if (!this.isBoundProject(projectKey)) return this.failure('stale', 'persona-source-scope-invalid')
+    const live = this.ensureLive()
+    if (live.status !== 'ok') return live
+    return this.run(this.stores.get(projectKey)!, { sqlStatements: 1, rowsVisited: 16,
+      materializedBytes: 16 * 512, keyBytes: this.keyBytes(projectKey) },
+    () => this.stores.get(projectKey)!.dashboardPersonaSourcePage(afterOrdinal, 15),
+    JSON.stringify(['persona-source-page', projectKey, afterOrdinal ?? null]))
+  }
+
   proveManagedPersonaSource(projectKey: string, id: string, revision: number): DashboardReadOutcome<'visible' | 'hidden' | 'unresolved'> {
     if (!this.isBoundProject(projectKey) || !this.validId(id) || !Number.isSafeInteger(revision) || revision < 1) {
       return this.failure('unavailable-probe', 'persona-source-invalid')
@@ -1479,7 +1542,7 @@ export class DashboardVisibilityReadSession {
   }
 
   /** Revalidate the persona identity and release the body only after all sources were proven. */
-  readManagedPersonaBody(projectKey: string, expected: { sourceCount: number; updatedAt: number; contentBytes: number; sourceIds: string[]; sourceRevisions: Record<string, number> }):
+  readManagedPersonaBody(projectKey: string, expected: { sourceCount: number; updatedAt: number; contentBytes: number; sourceIds: string[]; sourceRevisions: Record<string, number>; proofToken?: string }):
     DashboardReadOutcome<{ state: 'visible' | 'unresolved' | 'hidden'; reason?: string; content?: string; stale?: boolean }> {
     if (!this.isBoundProject(projectKey)) return this.failure('unavailable-probe', 'visibility-key-invalid')
     const live = this.ensureLive()
@@ -1490,7 +1553,13 @@ export class DashboardVisibilityReadSession {
     }
     const store = this.stores.get(projectKey)
     if (store === undefined) return this.failure('unavailable-probe', 'visibility-project-store-missing')
-    const plan = this.readManagedPersonaPlan(projectKey)
+    const stream = this.derivedProof
+    if (expected.proofToken !== undefined && (stream?.token !== expected.proofToken || stream.layer !== 'L3' ||
+        stream.projectKey !== projectKey || stream.count !== expected.sourceCount ||
+        stream.identity !== JSON.stringify([expected.sourceCount, expected.updatedAt, expected.contentBytes]))) {
+      return this.failure('stale', 'persona-stream-proof-invalid')
+    }
+    const plan = this.readManagedPersonaPlan(projectKey, expected.proofToken !== undefined)
     if (plan.status !== 'ok') return plan
     if (plan.value.state !== 'visible' || plan.value.sourceIds === undefined || plan.value.sourceRevisions === undefined ||
         plan.value.sourceCount !== expected.sourceCount || plan.value.updatedAt !== expected.updatedAt ||
@@ -1502,7 +1571,7 @@ export class DashboardVisibilityReadSession {
     if (this.memoProofStateLost) return { status: 'ok', value: { state: 'unresolved', reason: 'persona-proof-cache-lost' } }
     const now = this.readWallNow()
     if (now === undefined) { this.finishOnFailure(); return this.failure('unavailable-probe', 'visibility-wall-clock-invalid') }
-    for (const id of expected.sourceIds) {
+    for (const id of expected.proofToken === undefined ? expected.sourceIds : []) {
       const proof = this.memo.get(this.memoKey(projectKey, id))
       if (proof?.state !== 'visible' || proof.revision !== expected.sourceRevisions[id] ||
           proof.expiryAt !== undefined && proof.expiryAt !== null && proof.expiryAt <= now) {
@@ -1510,7 +1579,7 @@ export class DashboardVisibilityReadSession {
       }
     }
     const body = this.run(store, { sqlStatements: 1, rowsVisited: 1, materializedBytes: expected.contentBytes + 64,
-      keyBytes: this.keyBytes(projectKey) + expected.contentBytes }, () => store.dashboardPersonaBody(65_536),
+      keyBytes: this.keyBytes(projectKey) }, () => store.dashboardPersonaBody(65_536),
     JSON.stringify(['persona-body', projectKey, expected.contentBytes, expected.sourceCount, expected.updatedAt]))
     if (body.status !== 'ok') return body
     if (body.value.bytes !== expected.contentBytes || body.value.content === undefined ||
@@ -1594,7 +1663,7 @@ export class DashboardVisibilityReadSession {
           sourceCount: m.sourceCount, updatedAt: m.updatedAt, nextSourceIndex } }
       }
       const body = this.run(store, { sqlStatements: 1, rowsVisited: 1, materializedBytes: m.contentBytes + 64,
-        keyBytes: this.keyBytes(projectKey) + m.contentBytes }, () => store.dashboardPersonaBody(65_536))
+        keyBytes: this.keyBytes(projectKey) }, () => store.dashboardPersonaBody(65_536))
       if (body.status !== 'ok') return body
       if (body.value.bytes !== m.contentBytes || body.value.content === undefined ||
           Buffer.byteLength(body.value.content, 'utf8') !== m.contentBytes) {
@@ -2082,7 +2151,7 @@ export class DashboardVisibilityReadSession {
   }
 
   /** Finish this RPC and suspend the same S1 session until a later RPC resumes it. */
-  suspendForRpc(beforeHandoff?: () => DashboardReadOutcome<void>): DashboardSuspendOutcome {
+  suspendForRpc(beforeHandoff?: () => DashboardReadOutcome<void>, nextGlobalWindow = false): DashboardSuspendOutcome {
     if (this.ended || this.paused) return this.failure('stale', 'visibility-session-not-active')
     const finalCheck = this.validateSnapshotBoundary(true)
     if (finalCheck.status !== 'ok') {
@@ -2103,7 +2172,7 @@ export class DashboardVisibilityReadSession {
         return released
       }
     }
-    const finished = this.manager.finish(this.callToken, true)
+    const finished = nextGlobalWindow ? this.manager.finishGlobalWindow(this.callToken) : this.manager.finish(this.callToken, true)
     if (finished.status !== 'ok' || finished.value.continuationToken === undefined) {
       // finish(true) can reject the seventeenth continuation without ending the
       // active call; always retire it on this failure path.
@@ -2377,6 +2446,15 @@ export class DashboardVisibilityReadSession {
 
   /** Public prepublication scope/version/TTL proof for aggregate-owned DTOs. */
   publishProof(): DashboardReadOutcome<void> { return this.validateSnapshotBoundary(true) }
+
+  /** Carry only the earliest already-proven TTL across aggregate work windows. */
+  earliestVisibleExpiry(): number | undefined {
+    let earliest = this.provenExpiryAt
+    for (const proof of this.memo.values()) if (proof.state === 'visible' && typeof proof.expiryAt === 'number') {
+      earliest = earliest === undefined ? proof.expiryAt : Math.min(earliest, proof.expiryAt)
+    }
+    return earliest
+  }
 
   reserveReadState(bytes: number): DashboardReadOutcome<{ reservationToken: string }> {
     if (this.ended || this.paused) return this.failure('stale', 'visibility-session-not-active')
@@ -3452,6 +3530,7 @@ export class DashboardVisibilityReadSession {
           !this.validSourceEventId(identity.sourceEventId)) {
       return { state: 'unresolved', reason: 'source-identity-invalid' }
     }
+    if (!isConversationSource(identity.sourceKind)) return { state: 'hidden', reason: 'non-conversation-source' }
     return { state: 'visible' }
   }
 
@@ -3526,6 +3605,7 @@ export class DashboardVisibilityReadSession {
         if (sourceKind !== undefined && (typeof sourceKind !== 'string' || Buffer.byteLength(sourceKind, 'utf8') > 512)) {
           return { status: 'ok', value: { state: 'unresolved', reason: 'legacy-event-source-kind-invalid' } }
         }
+        if (!isConversationSource(sourceKind as string | undefined)) return { status: 'ok', value: { state: 'hidden', reason: 'non-conversation-source' } }
         return { status: 'ok', value: { state: 'visible', identity: { sourceEventId } } }
       } finally { this.releaseReservations([reserved.value]) }
     }
@@ -3760,7 +3840,7 @@ export class DashboardVisibilityReadSession {
   }
 
   private memoHasExpired(now: number): boolean {
-    return [...this.memo.values()].some((proof) => proof.state === 'visible' &&
+    return this.provenExpiryAt !== undefined && this.provenExpiryAt <= now || [...this.memo.values()].some((proof) => proof.state === 'visible' &&
       proof.expiryAt !== undefined && proof.expiryAt !== null && proof.expiryAt <= now)
   }
 
@@ -4351,6 +4431,7 @@ export class DashboardVisibilityReadSession {
     this.disposeDirectoryLabelReader()
     this.memo.clear()
     this.memoReservations.length = 0
+    this.derivedProof = undefined; this.provenExpiryAt = undefined
     try { this.onEnd?.(status, reason) } catch { /* best-effort listener cleanup */ }
   }
 
@@ -4371,6 +4452,7 @@ export class DashboardVisibilityReadSession {
     this.disposeDirectoryLabelReader()
     this.memo.clear()
     this.memoReservations.length = 0
+    this.derivedProof = undefined; this.provenExpiryAt = undefined
     try { this.onEnd?.(status, reason) } catch { /* best-effort listener cleanup */ }
   }
 

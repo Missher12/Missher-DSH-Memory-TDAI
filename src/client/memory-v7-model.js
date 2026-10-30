@@ -45,7 +45,10 @@ export function readGlobalMemory(transport, request, cancelled = () => false) {
       for (let round = 0; round < 17; round += 1) {
         readId = current?.readId ?? readId
         if (cancelled()) return undefined
-        if (!['ok', 'partial'].includes(current?.status) || !current.global) throw new Error('读取未完成，请重试')
+        if (!['ok', 'partial'].includes(current?.status) || !current.global) {
+          const error = new Error('读取未完成，请重试'); error.code = current?.status
+          throw error
+        }
         items = current.global.layer === 'home' ? current.global.items : [...items, ...current.global.items]
         if (items.length > 128) throw new Error('读取达到上限，请缩小搜索范围')
         if (!current.cursor) return { ...current, global: { ...current.global, items } }
@@ -54,6 +57,10 @@ export function readGlobalMemory(transport, request, cancelled = () => false) {
       }
       throw new Error('本批读取达到工作上限，请继续读取下一批')
     } finally {
+      if (cancelled() && current?.global?.next) {
+        const closed = await transport({ version: 1, action: 'close', readId: current.global.next })
+        if (closed?.status !== 'ok' || closed.complete !== true) throw new Error('读取资源尚未确认关闭，请重新连接 Memory 服务')
+      }
       if (readId) {
         try {
           const closed = await transport({ version: 1, action: 'close', readId })
@@ -73,6 +80,50 @@ export function readGlobalMemory(transport, request, cancelled = () => false) {
   return task
 }
 
+/** Follow native work windows automatically; a bookmark is never a user-facing page. */
+export async function readCompleteGlobalMemory(transport, request, cancelled = () => false, onProgress = () => {}) {
+  const { resume: initialResume, ...initial } = request
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let resume = attempt === 0 ? initialResume : undefined, last, bytes = 0
+    const rows = new Map(), recentBookmarks = []
+    try {
+      for (;;) {
+        if (cancelled()) return undefined
+        const consumed = resume
+        try { last = await readGlobalMemory(transport, { ...initial, ...(resume ? { resume } : {}) }, cancelled) }
+        finally {
+          if (consumed) {
+            const closed = await transport({ version: 1, action: 'close', readId: consumed })
+            if (closed?.status !== 'ok' || closed.complete !== true) throw new Error('读取资源尚未确认关闭，请重新连接 Memory 服务')
+          }
+        }
+        resume = last?.global?.next
+        if (cancelled() || !last) return undefined
+        if (last.global.layer !== 'home') for (const item of last.global.items) {
+          if (!rows.has(item.key)) bytes += JSON.stringify(item).length * 2
+          rows.set(item.key, item)
+          if (rows.size > 4096 || bytes > 16 * 1024 * 1024) throw new Error('结果较多，请使用搜索缩小范围')
+        }
+        const current = { ...last, global: { ...last.global, items: last.global.layer === 'home' ? last.global.items : [...rows.values()] } }
+        onProgress(current)
+        if (!resume) return current
+        if (recentBookmarks.includes(resume)) throw new Error('读取进度没有推进，请重新读取')
+        recentBookmarks.push(resume)
+        if (recentBookmarks.length > 32) recentBookmarks.shift()
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+    } catch (error) {
+      if (error.code !== 'stale' || attempt === 1 || cancelled()) throw error
+      resume = undefined
+    } finally {
+      if (resume) {
+        const closed = await transport({ version: 1, action: 'close', readId: resume })
+        if (closed?.status !== 'ok' || closed.complete !== true) throw new Error('读取资源尚未确认关闭，请重新连接 Memory 服务')
+      }
+    }
+  }
+}
+
 
 /** One immutable failed settings intent per mounted transport; only an explicit retry writes again. */
 export function createMemorySettingsMutation(actions) {
@@ -87,8 +138,10 @@ export function createMemorySettingsMutation(actions) {
   const send = async (patch) => {
     if (!controller.isActive() || busy || patch === undefined) return { kind: 'ignored' }
     const keys = Object.keys(patch)
-    const switchPatch = keys.length === 1 && ['generateMemory', 'useMemory'].includes(keys[0]) && typeof patch[keys[0]] === 'boolean'
-    if (!switchPatch) return { kind: 'ignored' }
+    const validPatch = keys.length === 1 &&
+      (['generateMemory', 'useMemory', 'characterEnabled'].includes(keys[0]) && typeof patch[keys[0]] === 'boolean' ||
+       keys[0] === 'characterDescription' && typeof patch.characterDescription === 'string' && patch.characterDescription.length <= 400)
+    if (!validPatch) return { kind: 'ignored' }
     const intent = Object.freeze({ ...patch }), started = controller.startSave(intent)
     if (!started.started) return { kind: 'ignored' }
     busy = true
@@ -101,7 +154,9 @@ export function createMemorySettingsMutation(actions) {
         return { kind: 'failed' }
       }
       failed = undefined
-      return { kind: 'saved', settings: { generateMemory: result.settings.generateMemory, useMemory: result.settings.useMemory } }
+      return { kind: 'saved', settings: { generateMemory: result.settings.generateMemory, useMemory: result.settings.useMemory,
+        ...(typeof result.settings.characterEnabled === 'boolean' ? { characterEnabled: result.settings.characterEnabled } : {}),
+        ...(typeof result.settings.characterDescription === 'string' ? { characterDescription: result.settings.characterDescription } : {}) } }
     } finally { busy = false }
   }
   return {

@@ -52,11 +52,11 @@ test('lastErrorState present and omitted stay visible without treating settings 
 // Original name retained. Human Demo v7 replaces the two old settings entrances with one inline gear.
 test('Dashboard uses the same read/ACK/close helper and both settings entry points', () => {
   const start = dashboard.indexOf('export function Dashboard(')
-  const entry = dashboard.slice(start, dashboard.indexOf('interface BoundedClientView', start))
+  const entry = dashboard.slice(start, dashboard.indexOf('function MemoryV7', start))
   assert.match(entry, /return <MemoryV7/u)
   assert.doesNotMatch(entry, /return <Loaded/u)
   const v7 = dashboard.slice(dashboard.indexOf('function MemoryV7('))
-  assert.match(v7, /readGlobalMemory\(props\.readDashboard/u)
+  assert.match(v7, /readCompleteGlobalMemory\(props\.readDashboard/u)
   // Exact retry/ACK/readback and calendar semantics are covered behaviorally in client-slot.test.mjs.
   assert.match(v7, /generateMemory.*useMemory/u)
   assert.match(v7, /token === mutation\.current/u)

@@ -15,7 +15,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { projectDbPath } from './project.js'
-import { matchExperienceConditions, rankTextCandidates, type ExperienceConditionMatch } from './r41.js'
+import { isConversationSource, matchExperienceConditions, rankTextCandidates, type ExperienceConditionMatch } from './r41.js'
 import { effectiveStartFromStored, effectiveStartIsUncertainAt, normalizeEffectiveStart, type EffectiveStart, type ValidFromBasis, type ValidFromPrecision } from './temporal.js'
 import { inspectMemoryDatabaseIdentity, inspectSqliteSchema, snapshotSqliteFile, type SqliteSchemaInspection } from './sqlite-inspection.js'
 import type { DashboardReadVersionStamp } from './dashboard-read.js'
@@ -23,6 +23,13 @@ import type { DashboardReadVersionStamp } from './dashboard-read.js'
 const require = createRequire(import.meta.url)
 
 export const MEMORY_SCHEMA_VERSION = 10
+
+// Apply source qualification before LIMIT so old injected rows cannot occupy a pending page.
+// Extraction queries consistently alias their L0 table as l.
+const CONVERSATION_SOURCE_SQL = `(l.role IN ('user', 'assistant') AND (
+  COALESCE(l.source_kind, 'conversation') IN ('', 'conversation') OR
+  l.role = 'user' AND l.source_kind IN ('user', 'user-question-reply') OR
+  l.role = 'assistant' AND l.source_kind = 'model'))`
 
 const DASHBOARD_ORIGIN_MAX_INDEXES = 16
 const DASHBOARD_ORIGIN_INDEX_LIST_LIMIT = DASHBOARD_ORIGIN_MAX_INDEXES + 1
@@ -254,7 +261,8 @@ export interface ExtractionJob {
   id: string
   sessionId: string
   policyRevision: string
-  status: 'queued' | 'ready' | 'dispatching' | 'result_ready' | 'completed' | 'failed' | 'source_pruned' | 'uncertain_remote' | 'blocked_charged'
+  status: 'queued' | 'ready' | 'dispatching' | 'result_ready' | 'completed' | 'failed' | 'source_pruned' | 'uncertain_remote' | 'blocked_charged' | 'superseded'
+  retryOf?: string
   createdAt: number
   updatedAt: number
   quietUntil: number
@@ -741,6 +749,21 @@ export function tokenize(text: string): string[] {
     .filter((token) => token !== '' && /[\p{L}\p{N}]/u.test(token))
 }
 
+/** Prefer meaningful question terms over repeated particles and trailing execution constraints. */
+export function recallQueryTerms(text: string): string[] {
+  const tokens = [...new Set(tokenize(text))]
+  const meaningful = tokens.filter((token) => token.length > 1 || /^[a-z0-9]$/u.test(token))
+  return (meaningful.length > 0 ? meaningful : tokens).slice(0, 6)
+}
+
+/** A short identifier must not match a digit/letter buried inside another code. */
+export function recallTermMatches(text: string, term: string): boolean {
+  const normalized = text.toLocaleLowerCase()
+  return /^[a-z0-9]$/u.test(term)
+    ? new RegExp(`(?<![a-z0-9_])${term}(?![a-z0-9_])`, 'u').test(normalized)
+    : normalized.includes(term)
+}
+
 export function normalizeMemoryText(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
@@ -873,6 +896,7 @@ function toExtractionJob(row: Record<string, unknown>): ExtractionJob {
     status: String(row.status) as ExtractionJob['status'], createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
     quietUntil: Number(row.quiet_until), mustRunBy: Number(row.must_run_by), sourceIds: parseIds(row.source_ids),
     inputSnapshot: parseJson<ExtractionJob['inputSnapshot']>(row.input_snapshot, []),
+    ...(typeof row.retry_of === 'string' ? { retryOf: row.retry_of } : {}),
     ...(typeof row.input_hash === 'string' ? { inputHash: row.input_hash } : {}),
     ...(typeof row.attempt_id === 'string' ? { attemptId: row.attempt_id } : {}),
     ...(typeof row.response_text === 'string' ? { responseText: row.response_text } : {}),
@@ -1105,6 +1129,13 @@ export class MemoryStore {
     this.db.exec('PRAGMA busy_timeout = 3000')
     this.db.exec('PRAGMA foreign_keys = ON')
     this.migrate()
+    // One-time derived-only repair for indexes produced before source qualification.
+    // Writer opens own migration; dashboard read-only connections never repair data.
+    const derivedPolicy = this.db.prepare("SELECT value FROM meta WHERE key = 'derived_source_policy'").get() as { value?: string } | undefined
+    if (derivedPolicy?.value !== 'conversation-v1') {
+      this.refreshScenes()
+      this.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('derived_source_policy', 'conversation-v1')").run()
+    }
   }
 
   private migrate(): void {
@@ -1580,6 +1611,8 @@ export class MemoryStore {
     this.ensureColumn('extraction_jobs', 'route_provider', 'TEXT')
     this.ensureColumn('extraction_jobs', 'route_model', 'TEXT')
     this.ensureColumn('extraction_jobs', 'agent_preset', 'TEXT')
+    this.ensureColumn('extraction_jobs', 'retry_of', 'TEXT')
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS extraction_jobs_retry ON extraction_jobs(retry_of) WHERE retry_of IS NOT NULL')
     this.ensureColumn('evaluation_runs', 'pair_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS evaluation_runs_pair ON evaluation_runs(pair_id, created_at)')
     this.db.exec(`
@@ -2015,7 +2048,7 @@ export class MemoryStore {
       const jobs = new Map<string, ReturnType<MemoryStore['extractionJobsForSources']>[number]>()
       for (const job of [...sourceJobs, ...outputJobs]) jobs.set(job.id, job)
       const redactSourceJob = this.db.prepare(`UPDATE extraction_jobs SET
-        status = CASE WHEN status IN ('queued','ready') THEN 'source_pruned'
+        status = CASE WHEN status IN ('queued','ready','failed') THEN 'source_pruned'
                       WHEN status IN ('result_ready','dispatching','uncertain_remote') THEN 'blocked_charged'
                       ELSE status END,
         error = CASE WHEN status IN ('completed','failed','blocked_charged') THEN error ELSE 'content_deleted' END,
@@ -2196,8 +2229,9 @@ export class MemoryStore {
     this.ensureOpen()
     const rows = this.db
       .prepare(
-        `SELECT id, role, content, created_at, source_event_id FROM l0_messages
-         WHERE session_id = ? AND extracted_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+        `SELECT l.id, l.role, l.content, l.created_at, l.source_event_id FROM l0_messages l
+         WHERE l.session_id = ? AND l.extracted_at IS NULL AND ${CONVERSATION_SOURCE_SQL}
+         ORDER BY l.created_at ASC, l.rowid ASC LIMIT ?`,
       )
       .all(sessionId, Math.max(1, Math.min(100, limit))) as unknown as Array<Record<string, unknown>>
     return rows.map((row) => ({
@@ -2291,10 +2325,19 @@ export class MemoryStore {
     const rows = this.db.prepare(`SELECT l.id, l.source_event_id FROM l0_messages l
       LEFT JOIN extraction_source_routes r ON r.source_id = l.id
       WHERE l.session_id = ? AND l.extracted_at IS NULL
+        AND ${CONVERSATION_SOURCE_SQL}
         AND NOT EXISTS (SELECT 1 FROM extraction_job_sources js JOIN extraction_jobs j ON j.id = js.job_id WHERE js.source_id = l.id)
       ORDER BY (COALESCE(l.provider, r.provider) IS NOT NULL AND COALESCE(l.model, r.model) IS NOT NULL) DESC,
         l.created_at, l.rowid LIMIT ?`).all(sessionId, Math.max(1, Math.min(24, limit))) as Array<{ id: string; source_event_id?: string }>
     return rows.map((row) => ({ id: row.id, ...(row.source_event_id == null ? {} : { sourceEventId: row.source_event_id }) }))
+  }
+
+  refreshUndispatchedExtractionPolicy(id: string, policyRevision: string): ExtractionJob | undefined {
+    this.ensureOpen()
+    this.db.prepare(`UPDATE extraction_jobs SET policy_revision = ?, updated_at = ?
+      WHERE id = ? AND status IN ('queued', 'ready') AND attempt_id IS NULL AND response_text IS NULL`)
+      .run(policyRevision, Date.now(), id)
+    return this.getExtractionJob(id)
   }
 
   enqueueExtractionJob(input: { sessionId: string; sourceId: string; policyRevision: string; quietMs: number; maxWaitMs: number; now?: number }): ExtractionJob {
@@ -2359,6 +2402,37 @@ export class MemoryStore {
     this.ensureOpen()
     const row = this.db.prepare('SELECT * FROM extraction_jobs WHERE id = ?').get(id) as Record<string, unknown> | undefined
     return row === undefined ? undefined : toExtractionJob(row)
+  }
+
+  extractionRetry(id: string): ExtractionJob | undefined {
+    const row = this.db.prepare('SELECT * FROM extraction_jobs WHERE retry_of = ?').get(id) as Record<string, unknown> | undefined
+    return row === undefined ? undefined : toExtractionJob(row)
+  }
+
+  /** Explicit recovery creates a new lineage; original calls, errors and frozen inputs stay auditable. */
+  createExtractionRetry(id: string, input: { sourceIds: string[]; provider: string; model: string; policyRevision: string; reason: string }): ExtractionJob {
+    this.ensureOpen()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const prior = this.extractionRetry(id)
+      if (prior) { this.db.exec('COMMIT'); return prior }
+      const old = this.getExtractionJob(id)
+      if (!old || !['failed', 'queued'].includes(old.status) || old.status === 'queued' && old.attemptId) throw new Error('only failed or unsent jobs can be recovered')
+      const sourceIds = [...new Set(input.sourceIds)]
+      if (!sourceIds.length || sourceIds.length > 24 || sourceIds.some(source => !old.sourceIds.includes(source)) ||
+          !this.extractionSourcesPending(id, old.sessionId, sourceIds)) throw new Error('recovery sources are missing, consumed or no longer owned by the job')
+      const now = Date.now(), nextId = `job_${randomUUID().replace(/-/g, '').slice(0, 20)}`
+      this.db.prepare(`INSERT INTO extraction_jobs(id, session_id, policy_revision, status, created_at, updated_at,
+        quiet_until, must_run_by, source_ids, input_snapshot, route_provider, route_model, agent_preset, retry_of, error)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?)`)
+        .run(nextId, old.sessionId, input.policyRevision, now, now, now, now, JSON.stringify(sourceIds), input.provider, input.model,
+          old.agentPreset ?? null, id, `explicit_recovery:${input.reason.slice(0, 500)}`)
+      for (const sourceId of sourceIds) this.db.prepare('UPDATE extraction_job_sources SET job_id = ?, assigned_at = ? WHERE job_id = ? AND source_id = ?')
+        .run(nextId, now, id, sourceId)
+      this.db.prepare("UPDATE extraction_jobs SET status = 'superseded', updated_at = ? WHERE id = ?").run(now, id)
+      this.db.exec('COMMIT')
+      return this.getExtractionJob(nextId)!
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
 
   verifyCommittedExtraction(input: { jobId: string; attemptId: string; responseText: string; usage: ExtractionJob['usage'] }): boolean {
@@ -3747,6 +3821,29 @@ export class MemoryStore {
     return row?.status === 'candidate' || row?.status === 'approved' || row?.status === 'forgotten' ? row.status : undefined
   }
 
+  /** Bounded approved preference records for one exact scene; character guidance selection only. */
+  approvedSceneRecords(scene: string, limit: number): MemoryRecord[] {
+    this.ensureOpen()
+    const bounded = Number.isSafeInteger(limit) ? Math.max(0, Math.min(50, Math.floor(limit))) : 0
+    if (bounded === 0 || typeof scene !== 'string' || scene === '' || Buffer.byteLength(scene) > 512) return []
+    const rows = this.db.prepare(
+      "SELECT * FROM l1_memories WHERE project_key = ? AND status = 'approved' AND kind = 'preference' AND scene = ? ORDER BY updated_at DESC LIMIT ?",
+    ).all(projectKeyOfFile(this.file), scene, bounded) as Record<string, unknown>[]
+    return rows.map((row) => toRecord(row))
+  }
+
+  /** Bounded real user evidence for the canonical communication-style projection. */
+  userStyleEvidence(ids: string[]): string[] {
+    this.ensureOpen()
+    const unique = [...new Set(ids.filter((id) => typeof id === 'string' && id !== '' && Buffer.byteLength(id) <= 256))].slice(0, 8)
+    if (unique.length === 0) return []
+    const placeholders = unique.map(() => '?').join(',')
+    const rows = this.db.prepare(`SELECT substr(content, 1, 2048) AS content FROM l0_messages
+      WHERE id IN (${placeholders}) AND role = 'user' AND COALESCE(source_kind, 'conversation') IN ('user', 'user-question-reply', 'conversation', '')
+      ORDER BY created_at, rowid LIMIT 8`).all(...unique) as Array<{ content?: unknown }>
+    return rows.flatMap((row) => typeof row.content === 'string' ? [row.content] : [])
+  }
+
   /** One raw approved-row keyset page for the internal visibility reader; no body or JSON enters JS. */
   dashboardVisibilityMemoryPage(after?: DashboardVisibilityMemoryCursor, limit = 16, status: MemoryStatus = 'approved'): {
     rows: DashboardVisibilityMemoryPageRow[]; hasMore: boolean
@@ -4602,6 +4699,21 @@ export class MemoryStore {
   }
 
   /** Profile browser: one integer-key row, bounded SQL projection before materialization. */
+  globalExtractionJobRow(after: number): { ordinal: number; status: string; error: string; updatedAt: number; provider: string; model: string;
+    hasPendingConversation: boolean; sourcesComplete: boolean } | undefined {
+    this.ensureOpen()
+    const row = this.db.prepare(`SELECT j.rowid AS ordinal, j.status, substr(COALESCE(j.error, ''), 1, 512) AS error,
+      j.updated_at, substr(COALESCE(j.route_provider, ''), 1, 256) AS provider, substr(COALESCE(j.route_model, ''), 1, 256) AS model,
+      (SELECT count(*) FROM (SELECT source_id FROM extraction_job_sources INDEXED BY extraction_job_sources_job WHERE job_id = j.id LIMIT 25)) AS source_count,
+      EXISTS (SELECT 1 FROM (SELECT source_id FROM extraction_job_sources INDEXED BY extraction_job_sources_job WHERE job_id = j.id LIMIT 24) js
+        JOIN l0_messages l ON l.id = js.source_id
+        WHERE l.session_id = j.session_id AND l.extracted_at IS NULL AND ${CONVERSATION_SOURCE_SQL}) AS pending_conversation
+      FROM extraction_jobs j WHERE j.rowid > ? ORDER BY j.rowid LIMIT 1`).get(after) as Record<string, unknown> | undefined
+    return row === undefined ? undefined : { ordinal: Number(row.ordinal), status: String(row.status), error: String(row.error),
+      updatedAt: Number(row.updated_at), provider: String(row.provider), model: String(row.model),
+      hasPendingConversation: row.pending_conversation === 1, sourcesComplete: Number(row.source_count) <= 24 }
+  }
+
   globalSourceRow(after: number): { ordinal: number; id?: string; content?: string; sessionId?: string; createdAt?: number } | undefined {
     this.ensureOpen()
     const row = this.db.prepare(`SELECT rowid AS ordinal,
@@ -4670,6 +4782,27 @@ export class MemoryStore {
       FROM l1_revisions WHERE rowid > ? ORDER BY rowid LIMIT 1`).get(after) as Record<string, unknown> | undefined
     return row === undefined ? undefined : { ordinal: Number(row.ordinal), revision: globalSafeInteger(row.revision), at: globalSafeInteger(row.recorded_at, 8640000000000000),
       ...(typeof row.id === 'string' ? { id: row.id } : {}), ...(typeof row.reason === 'string' ? { reason: row.reason } : {}) }
+  }
+
+  /** Group one memory's revisions together so calendar deduplication has bounded residency. */
+  globalCalendarRevision(after?: { id: string; revision: number }): ReturnType<MemoryStore['globalRevisionRow']> {
+    this.ensureOpen()
+    const row = this.db.prepare(`SELECT rowid AS ordinal,
+      CASE WHEN typeof(memory_id) = 'text' AND length(CAST(memory_id AS BLOB)) <= 256 THEN memory_id END AS id,
+      CASE WHEN typeof(revision) IN ('integer', 'real') AND revision >= 1 AND revision <= 9007199254740991
+        AND revision = CAST(revision AS INTEGER) THEN CAST(revision AS INTEGER) END AS revision,
+      CASE WHEN typeof(recorded_at) IN ('integer', 'real') AND recorded_at >= 0 AND recorded_at <= 8640000000000000
+        AND recorded_at = CAST(recorded_at AS INTEGER) THEN CAST(recorded_at AS INTEGER) END AS recorded_at,
+      CASE WHEN length(CAST(reason AS BLOB)) <= 512 THEN reason END AS reason
+      FROM l1_revisions WHERE (memory_id, revision) > (?, ?) ORDER BY memory_id, revision LIMIT 1`)
+      .get(after?.id ?? '', after?.revision ?? 0) as Record<string, unknown> | undefined
+    if (row === undefined) return undefined
+    if (typeof row.id !== 'string' || Buffer.byteLength(row.id) > 256 || globalSafeInteger(row.revision) === undefined) {
+      throw new Error('calendar revision identity invalid')
+    }
+    return { ordinal: Number(row.ordinal), id: row.id, revision: Number(row.revision),
+      at: globalSafeInteger(row.recorded_at, 8640000000000000),
+      ...(typeof row.reason === 'string' && Buffer.byteLength(row.reason) <= 512 ? { reason: row.reason } : {}) }
   }
 
   globalDerivedSources(layer: 'L2' | 'L3', id: string): { updatedAt: number; ids: string[]; revisions: Record<string, number> } | undefined {
@@ -5108,6 +5241,14 @@ export class MemoryStore {
     records.forEach((record, ordinal) => insert.run(projectKey, name, record.id, record.revision, ordinal))
   }
 
+  /** Keep generated/plugin text out of derived scenes, including after L0 body retention. */
+  private sceneRecordEligible(record: MemoryRecord): boolean {
+    return record.sourceMessageIds.every((id) => {
+      const identity = this.sourceIdentity(id)
+      return identity === undefined || isConversationSource(identity.sourceKind)
+    })
+  }
+
   /** Increment the current scene membership for a newly approved candidate without rematerializing the whole scene. */
   advanceSceneIndexForApproval(id: string, now = Date.now()): boolean {
     this.ensureOpen()
@@ -5125,6 +5266,10 @@ export class MemoryStore {
         return false
       }
       const effective = this.getApprovedForRead(id, [], now)
+      if (effective !== undefined && !this.sceneRecordEligible(effective)) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
       const approvalUpdatedAt = effective?.updatedAt ?? Number((this.db.prepare('SELECT updated_at FROM l1_memories WHERE project_key = ? AND id = ?')
         .get(projectKeyOfFile(this.file), id) as { updated_at?: number } | undefined)?.updated_at ?? 0)
       if (approvalUpdatedAt <= lastRefreshAt) {
@@ -5255,6 +5400,7 @@ export class MemoryStore {
     const groups = new Map<string, MemoryRecord[]>()
     if (sceneNames === undefined) {
       for (const record of this.approvedRecords([], now, now)) {
+        if (!this.sceneRecordEligible(record)) continue
         const name = record.scene?.trim() || 'general'
         const list = groups.get(name) ?? []
         list.push(record)
@@ -5263,6 +5409,7 @@ export class MemoryStore {
     } else {
       for (let offset = 0; offset < sceneNames.length; offset += 100) {
         for (const record of this.approvedRecords([], now, now, sceneNames.slice(offset, offset + 100))) {
+          if (!this.sceneRecordEligible(record)) continue
           const name = record.scene?.trim() || 'general'
           const list = groups.get(name) ?? []
           list.push(record)
@@ -5392,14 +5539,17 @@ export class MemoryStore {
     })), hasMore: rows.length > bounded }
   }
 
-  dashboardPersonaMeta(): { contentBytes: number; sourceCount: number; updatedAt: number; sourceIdsBytes: number; sourceRevisionsBytes: number } | undefined {
+  dashboardPersonaMeta(): { contentBytes: number; sourceCount: number; sourceArrayCount: number; updatedAt: number; sourceIdsBytes: number; sourceRevisionsBytes: number } | undefined {
     this.ensureOpen()
     const row = this.db.prepare(`SELECT COALESCE(length(CAST(content AS BLOB)), 0) AS content_bytes,
-      source_count, updated_at, COALESCE(length(CAST(source_ids AS BLOB)), 0) AS source_ids_bytes,
+      source_count, CASE WHEN json_valid(source_ids) AND json_valid(source_revisions) THEN
+        CASE WHEN json_type(source_ids) = 'array' AND json_type(source_revisions) = 'object'
+          THEN json_array_length(source_ids) ELSE -1 END ELSE -1 END AS source_array_count,
+      updated_at, COALESCE(length(CAST(source_ids AS BLOB)), 0) AS source_ids_bytes,
       COALESCE(length(CAST(source_revisions AS BLOB)), 0) AS source_revisions_bytes
       FROM l3_persona WHERE project_key = ?`).get(projectKeyOfFile(this.file)) as Record<string, unknown> | undefined
     if (row === undefined) return undefined
-    return { contentBytes: Number(row.content_bytes ?? 0), sourceCount: Number(row.source_count ?? 0),
+    return { contentBytes: Number(row.content_bytes ?? 0), sourceCount: Number(row.source_count ?? 0), sourceArrayCount: Number(row.source_array_count ?? -1),
       updatedAt: Number(row.updated_at ?? 0), sourceIdsBytes: Number(row.source_ids_bytes ?? 0),
       sourceRevisionsBytes: Number(row.source_revisions_bytes ?? 0) }
   }
@@ -5425,6 +5575,25 @@ export class MemoryStore {
     return { sourceIdsBytes: Number(row.ids_bytes ?? 0), sourceRevisionsBytes: Number(row.revisions_bytes ?? 0),
       ...(typeof row.source_ids === 'string' ? { sourceIds: row.source_ids } : {}),
       ...(typeof row.source_revisions === 'string' ? { sourceRevisions: row.source_revisions } : {}) }
+  }
+
+  /** Page the persisted provenance in SQLite; never materialize the whole JSON index in JS. */
+  dashboardPersonaSourcePage(afterOrdinal: number | undefined, limit: number): { rows: Array<{
+    memoryId?: string; memoryIdBytes: number; revision: number; ordinal: number }>; hasMore: boolean } {
+    this.ensureOpen()
+    const bounded = Math.max(1, Math.min(15, Math.trunc(limit)))
+    const rows = this.db.prepare(`SELECT j.key AS ordinal,
+      CASE WHEN j.type = 'text' AND length(CAST(j.value AS BLOB)) <= 256 THEN j.value END AS memory_id,
+      length(CAST(j.value AS BLOB)) AS id_bytes,
+      json_extract(p.source_revisions, '$.' || json_quote(j.value)) AS revision
+      FROM l3_persona p, json_each(p.source_ids) j
+      WHERE p.project_key = ? AND j.key > ? ORDER BY j.key LIMIT ?`)
+      .all(projectKeyOfFile(this.file), afterOrdinal ?? -1, bounded + 1) as Array<Record<string, unknown>>
+    return { rows: rows.slice(0, bounded).map((row) => ({
+      ...(typeof row.memory_id === 'string' ? { memoryId: row.memory_id } : {}),
+      memoryIdBytes: Number(row.id_bytes ?? 0), revision: typeof row.revision === 'number' ? row.revision : 0,
+      ordinal: Number(row.ordinal),
+    })), hasMore: rows.length > bounded }
   }
 
   scenes(): SceneRecord[] {

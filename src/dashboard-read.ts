@@ -129,7 +129,7 @@ type SessionState = {
   readonly id: string
   binding: DashboardReadBinding
   bindingKey: string
-  readonly startedAt: number
+  startedAt: number
   lastUsedAt: number
   readonly work: DashboardReadCounters
   readonly probes: Map<string, DashboardReadVersionStamp>
@@ -604,6 +604,23 @@ export class DashboardReadSessionManager {
     this.#sessionBytes += TOKEN_ACCOUNTING_BYTES
     this.#continuations.set(continuationToken, session.id)
     return { status: 'ok', value: { continuationToken } }
+  }
+
+  /** Start the next bounded global work window without replacing live connection probes.
+   * Only the trusted global coordinator calls this, after its final publication proof.
+   * Resident leases and original version stamps survive; work counters and window age do not.
+   */
+  finishGlobalWindow(callToken: string): DashboardReadOutcome<{ continuationToken?: string }> {
+    const resolved = this.#resolveCall(callToken)
+    if ('status' in resolved) return resolved
+    const { session, now } = resolved
+    if (session.binding.viewKey !== 'memory.global.v7') return failure('stale', 'global-window-scope-invalid')
+    const finished = this.finish(callToken, true)
+    if (finished.status !== 'ok') return finished
+    Object.assign(session.work, emptyCounters())
+    session.startedAt = now
+    session.progressRetained = false
+    return finished
   }
 
   cancel(callToken: string): DashboardReadOutcome<void> {

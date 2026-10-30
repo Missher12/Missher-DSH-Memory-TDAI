@@ -140,8 +140,9 @@ test('client bundle registers the Memory settings section through the module loa
     remote.updateSettingsAck = originalUpdateSettingsAck
 
     const originalReadDashboard = remote.readDashboard
-    remote.readDashboard = async () => ({ ok: false, failure: { code: 'synthetic-transport' } })
-    await assert.rejects(() => actions.readDashboard({ version: 1, action: 'settings' }), /synthetic-transport/u)
+    const nativeTransportError = Object.assign(new Error('synthetic-transport'), { code: 'transport' })
+    remote.readDashboard = async () => ({ ok: false, error: nativeTransportError })
+    await assert.rejects(() => actions.readDashboard({ version: 1, action: 'settings' }), error => error === nativeTransportError)
     remote.readDashboard = originalReadDashboard
 
     const pendingLoad = () => new Promise(() => {})
@@ -205,6 +206,20 @@ function memorySettingsTransport({ write, read } = {}) {
     },
   } }
 }
+
+test('Memory settings saves character fields with ACK and exact readback rather than ignoring them', async () => {
+  const { createMemorySettingsMutation } = await import('../src/client/memory-v7-model.js')
+  const transport = memorySettingsTransport()
+  Object.assign(transport.state, { characterEnabled: false, characterDescription: '' })
+  const controller = createMemorySettingsMutation(transport.actions)
+  try {
+    assert.equal((await controller.save({ characterEnabled: true })).kind, 'saved')
+    assert.equal(transport.state.characterEnabled, true)
+    const result = await controller.save({ characterDescription: '坦率、耐心' })
+    assert.equal(result.kind, 'saved')
+    assert.equal(result.settings.characterDescription, '坦率、耐心')
+  } finally { controller.dispose() }
+})
 
 test('Memory settings retry resends the exact failed switch patch and waits for ACK plus matching readback', async () => {
   const { createMemorySettingsMutation } = await import('../src/client/memory-v7-model.js')

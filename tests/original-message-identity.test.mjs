@@ -73,14 +73,20 @@ test('official user/message and assistant/message wrappers produce scoped, dedup
       data: { id: 'same-original-id', role: 'user', content: [{ type: 'text', text: 'same text in another session' }] },
     })
 
+    const capturedStore = openProjectStore(root, projectA.key, projectA)
+    try {
+      assert.equal(capturedStore.db.prepare("SELECT count(*) AS n FROM l0_messages WHERE content = 'role mismatch'").get().n, 0,
+        'a user-role payload in an assistant wrapper is rejected instead of being relabelled as assistant evidence')
+    } finally { capturedStore.close() }
+
     const resultA = overview(runtime, projectA.key)
-    assert.equal(resultA.period.captures, 9, 'an exact wrapped-event replay remains one capture event')
+    assert.equal(resultA.period.captures, 8, 'an exact wrapped-event replay remains one capture event; a mismatched role is not captured')
     assert.equal(resultA.period.recordedOriginalMessageLowerBound, 4,
       'same ID across seq is one; a different ID, role, and session are distinct')
-    assert.equal(resultA.period.unknownOriginalMessageEvents, 4,
-      'outer payload IDs, empty/non-string IDs, and role-mismatched message IDs remain unknown')
+    assert.equal(resultA.period.unknownOriginalMessageEvents, 3,
+      'outer payload IDs and empty/non-string IDs remain unknown; role-mismatched messages are rejected')
     assert.equal(resultA.period.topSessions[0].recordedOriginalMessageLowerBound, 3)
-    assert.equal(resultA.period.topSessions[0].unknownOriginalMessageEvents, 4)
+    assert.equal(resultA.period.topSessions[0].unknownOriginalMessageEvents, 3)
 
     runtime.close()
     runtime = undefined

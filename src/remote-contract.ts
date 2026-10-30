@@ -160,6 +160,8 @@ export const DashboardSnapshotSchema = z
         extractionEveryN: z.number(),
         autoApproveConfidence: z.number(),
         extractionEnabled: z.boolean(),
+        characterEnabled: z.boolean(),
+        characterDescription: z.string(),
       })
       .strict(),
     lastError: z.string().optional(),
@@ -185,6 +187,10 @@ export const UpdateSettingsRequestSchema = z
     globalPersona: z.boolean().optional(),
     extractionEveryN: z.number().int().min(1).max(100).optional(),
     extractionEnabled: z.boolean().optional(),
+    extractionProvider: z.string().max(160).optional(),
+    extractionModel: z.string().max(240).optional(),
+    characterEnabled: z.boolean().optional(),
+    characterDescription: z.string().max(400).optional(),
   })
   .strict()
 
@@ -241,7 +247,7 @@ export const OverviewResultSchema = z.object({
   }).strict(),
   processing: z.object({
     queued: z.number(), oldestWaitingAt: z.number().nullable(), failed: z.number(), uncertainUsage: z.number(),
-    jobs: z.array(z.object({ id: z.string(), status: z.enum(['queued', 'ready', 'dispatching', 'result_ready', 'completed', 'failed', 'source_pruned', 'uncertain_remote', 'blocked_charged']),
+    jobs: z.array(z.object({ id: z.string(), status: z.enum(['queued', 'ready', 'dispatching', 'result_ready', 'completed', 'failed', 'source_pruned', 'uncertain_remote', 'blocked_charged', 'superseded']),
       updatedAt: z.number(), provider: z.string().optional(), model: z.string().optional(), hasError: z.boolean(), error: z.string().optional() }).strict()),
   }).strict(),
   coverage: z.object({
@@ -282,10 +288,10 @@ export const ManageRequestSchema = z.object({
     'decision.impact', 'knowledge.list', 'knowledge.detail', 'knowledge.history', 'evaluation.list', 'evaluation.save', 'evaluation.run',
     'strategy.list', 'strategy.propose', 'strategy.shadow', 'strategy.select', 'strategy.rollback',
     'attempt.list', 'attempt.reviewUnknown', 'billable.list', 'billable.reviewUnknown', 'billable.reconcileUsage', 'billable.summary', 'overview.detail',
-    'overview.repeated', 'processing.jobs', 'processing.coverage',
+    'overview.repeated', 'processing.jobs', 'processing.coverage', 'processing.recover',
     'source.revoke.preview', 'source.revoke', 'content.delete.inventory', 'content.delete.preview', 'content.delete.apply',
     'recovery.snapshot', 'recovery.list', 'recovery.plan', 'recovery.apply',
-    'v7.forget',
+    'v7.forget', 'v7.approve',
   ]),
   payload: z.record(z.string(), z.unknown()).default({}),
 }).strict()
@@ -351,6 +357,7 @@ export const ReadDashboardRepeatedSchema = z.object({
 
 export const ReadDashboardRequestSchema = z.discriminatedUnion('action', [
   z.object({ version: z.literal(1), action: z.literal('global'), readId: z.never().optional(), resume: z.string().uuid().optional(),
+    status: z.enum(['approved', 'candidate']).optional(),
     layer: z.enum(['home', 'L0', 'L1', 'L2', 'L3']), query: z.string().max(200).default(''),
     relationDepth: z.number().int().min(0).max(2).optional(),
     year: z.number().int().min(1970).max(9998), timeZone: z.string().min(1).max(128),
@@ -417,6 +424,8 @@ export const ReadDashboardSettingsSchema = z.object({
   generateMemory: z.boolean().optional(), useMemory: z.boolean().optional(),
   mode: z.string().max(32), recallMaxTokens: z.number(), extractionEveryN: z.number().min(1).max(100),
   extractionEnabled: z.boolean(), includePersona: z.boolean(), globalPersona: z.boolean(),
+  extractionProvider: z.string().max(160).optional(), extractionModel: z.string().max(240).optional(),
+  characterEnabled: z.boolean(), characterDescription: z.string().max(400),
 }).strict()
 
 export const ReadDashboardPagePersonaSchema = z.object({
@@ -583,9 +592,11 @@ export const GlobalMemoryItemSchema = z.object({
   createdAt: z.number(), updatedAt: z.number(), revision: z.number().int().positive().optional(),
   scene: z.string().max(512).optional(),
   sources: z.array(z.object({ id: z.string().max(256), projectKey: ProjectKeySchema.optional(), sessionId: z.string().max(512).optional(),
-    createdAt: z.number().optional() }).strict()).max(100), sourcesComplete: z.boolean(),
+    createdAt: z.number().optional() }).strict()).max(300), sourcesComplete: z.boolean(),
 }).strict()
 export const GlobalMemoryPageSchema = z.object({
+  processing: z.object({ queued: z.number().int().nonnegative(), failed: z.number().int().nonnegative(), uncertain: z.number().int().nonnegative(), pendingApproval: z.number().int().nonnegative(),
+    latestIssue: z.string().max(1024).optional() }).strict().optional(),
   next: z.string().uuid().optional(),
   layer: z.enum(['home', 'L0', 'L1', 'L2', 'L3']), query: z.string().max(200),
   items: z.array(GlobalMemoryItemSchema).max(8),

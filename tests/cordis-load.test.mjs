@@ -1,11 +1,45 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import * as plugin from '../lib/index.js'
 import { sourceAwareStream } from './helpers.mjs'
+import { projectIdentity } from '../lib/project.js'
+import { openProjectStoreReadOnly } from '../lib/store.js'
+
+test('real restricted Cordis contexts use Host profile identity for default data isolation', async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'tdai-cordis-profiles-'))
+  const cwd = path.join(home, 'workspace'), key = projectIdentity(cwd).key
+  mkdirSync(cwd)
+  const instances = []
+  try {
+    for (const name of ['a', 'b']) {
+      const profile = path.join(home, 'profiles', name); mkdirSync(profile, { recursive: true })
+      const root = new Context(), session = { id: `session-${name}`, header: { cwd, agentPreset: 'agent-mock' } }
+      root.provide('tools', { register() { return () => {} } })
+      root.provide('sessions', { get: () => session })
+      root.provide('dshHomePath', (...segments) => path.join(home, ...segments))
+      root.provide('profileContext', { dir: profile })
+      const fiber = await root.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply },
+        { extraction: { enabled: false }, capture: { excludeAgents: [] } })
+      instances.push({ root, fiber })
+      fiber.ctx.emit('session/event', session, { type: 'user/message', seq: 1,
+        data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `Synthetic profile-${name} source.` }] } })
+      const expected = path.join(profile, 'memory-tdai')
+      assert.equal(existsSync(path.join(expected, 'projects', key, 'memory.db')), true)
+      const store = openProjectStoreReadOnly(expected, key)
+      try {
+        assert.equal(store.unextracted(session.id).length, 1)
+        assert.equal(store.unextracted(`session-${name === 'a' ? 'b' : 'a'}`).length, 0)
+      } finally { store.close() }
+    }
+  } finally {
+    for (const { root, fiber } of instances.reverse()) { await fiber.dispose(); await root.fiber.dispose() }
+    rmSync(home, { recursive: true, force: true })
+  }
+})
 
 test('plugin loads as a real Cordis plugin with injected Host services', async () => {
   const root = new Context()

@@ -132,6 +132,51 @@ test('plugin entry registers tools, captures L0, extracts, and injects at pre-st
   }
 })
 
+test('pre-step selects the actual user query instead of a later plugin injection', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-query-source-'))
+  const cwd = root, host = createHost(cwd)
+  try {
+    const project = projectIdentity(cwd), store = openProjectStore(root, project.key, project)
+    store.addMemory({ content: 'zebraraft uses the blue archive.', kind: 'fact', status: 'approved' })
+    store.addMemory({ content: 'orangepike uses the orange archive.', kind: 'fact', status: 'approved' })
+    store.close()
+    apply(host, { dataDir: root, extraction: { enabled: false }, capture: { excludeAgents: [] },
+      recall: { enabled: true, minScore: 0.01, maxTokens: 600 } })
+    const payload = { agent: { session: { id: 's1', header: { cwd, agentPreset: 'agent-mock' } } }, messages: [
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'zebraraft' }] },
+      { role: 'user', source: { kind: 'plugin:mse-learning' }, content: [{ type: 'text', text: 'orangepike' }] },
+    ] }
+    const [decision] = await host.emit('agent/pre-step', payload, async () => ({ kind: 'enter', messages: payload.messages }))
+    const packet = decision.messages.find(message => message.source?.plugin === 'memory-tdai')?.content[0].text
+    assert.match(packet ?? '', /zebraraft/)
+    assert.doesNotMatch(packet ?? '', /orangepike/)
+  } finally {
+    for (const dispose of host.disposers) dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('stable character remains available on a continuation without a genuine user query', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-character-continuation-'))
+  const host = createHost(root)
+  try {
+    const project = projectIdentity(root), store = openProjectStore(root, project.key, project)
+    store.addMemory({ content: 'orangepike uses the orange archive.', kind: 'fact', status: 'approved' })
+    store.close()
+    apply(host, { dataDir: root, character: { enabled: true }, extraction: { enabled: false }, capture: { excludeAgents: [] } })
+    const payload = { agent: { session: { id: 's1', header: { cwd: root, agentPreset: 'agent-mock' } } }, messages: [
+      { role: 'user', source: { kind: 'plugin:mse-learning' }, content: [{ type: 'text', text: 'orangepike' }] },
+    ] }
+    const [decision] = await host.emit('agent/pre-step', payload, async () => ({ kind: 'enter', messages: payload.messages }))
+    const packet = decision.messages.find(message => message.source?.plugin === 'memory-tdai')?.content[0].text
+    assert.match(packet ?? '', /character-guidance/)
+    assert.doesNotMatch(packet ?? '', /memory-context|orangepike/)
+  } finally {
+    for (const dispose of host.disposers) dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('pre-step rebuilds retained memory context from current readable revisions', async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'tdai-plugin-recall-context-'))
   const cwd = mkdtempSync(path.join(os.tmpdir(), 'tdai-plugin-recall-project-'))

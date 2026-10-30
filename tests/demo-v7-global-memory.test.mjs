@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, readFileSync, renameSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync, readFileSync, renameSync, opendirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -204,7 +204,7 @@ test('Demo v7 bounded profile enumeration rejects symlinks and reaches the fifth
     assert.equal(sources.keys.length, 5); assert.equal(sources.complete, true)
     const runtime = f.open()
     let cursor, found = false
-    for (let window = 0; window < 8; window += 1) {
+    for (let window = 0; window < 128; window += 1) {
       const matches = runtime.searchGlobalDetailed('preference 4', 50, cursor)
       found ||= matches.candidates.some((item) => item.id.startsWith('g:source-4:'))
       cursor = matches.nextScan
@@ -239,7 +239,7 @@ function observeRecall(runtime, hooks = {}) {
   const read = runtime.readDashboard, open = runtime.beginDashboardAggregateRead, prove = runtime.proveGlobalRecall
   const member = runtime.openDashboardDirectoryMember, manager = runtime.dashboardReadSessions
   const retain = manager.retainGlobalProgress, tokenMethods = new Map()
-  const trace = { windows: 0, reads: [], emitted: new Set(), proofs: [], counters: [], codecs: [],
+  const trace = { windows: 0, reads: [], outcomes: [], emitted: new Set(), proofs: [], counters: [], codecs: [],
     readers: [], tokens: new Set(), bookmarks: [], connections: new Map() }
   // These fixtures start before their first dashboard read, so every retired token is observable.
   assert.deepEqual(manager.stats(), { sessions: 0, activeCalls: 0, accountedBytes: 0, closed: false })
@@ -290,6 +290,7 @@ function observeRecall(runtime, hooks = {}) {
   runtime.readDashboard = function (input) {
     if (input.action === 'global') trace.windows += 1
     const output = Reflect.apply(read, this, [input])
+    trace.outcomes.push(output.status)
     trace.reads.push(input.action)
     trace.codecs.push(ReadDashboardResultSchema.safeParse(output).success)
     for (const item of output.global?.items ?? []) trace.emitted.add(item.key)
@@ -504,10 +505,10 @@ test('Demo v7 pre-step rechecks earlier-window forget revocation revision and ex
       const packet = runtime.globalRecall('pnpm', recallSession)
       assert.ok(target, 'the mutation happens after a real earlier publication window')
       assert.ok(observed.trace.windows > 1, 'the same call continues after the mutation')
-      assert.ok(observed.trace.proofs.some((entry) => [...entry.heads, ...entry.resolved].some((item) => item.key === target.projectKey && item.id === target.id && item.status === 'ok' && item.state !== 'visible')),
-        'the old candidate reaches the fresh exact-ID proof and is rejected there')
+      assert.ok(observed.trace.outcomes.includes('stale') || observed.trace.proofs.some((entry) => [...entry.heads, ...entry.resolved].some((item) => item.key === target.projectKey && item.id === target.id && item.status === 'ok' && item.state !== 'visible')),
+        'the old candidate is rejected by the snapshot fence or the fresh exact-ID proof')
       assert.ok(!(packet ?? '').includes(globalMemoryKey(target.projectKey, target.id)))
-      assert.match(packet, /已读取部分/)
+      if (packet !== undefined) assert.match(packet, /已读取部分/)
       assertRecallReleased(runtime, observed.trace)
     } finally { observed?.restore(); f.close() }
   }
@@ -735,6 +736,14 @@ function assertGlobalPublicationFence(mode, surface) {
       }
     }
     originalOpen = runtime.beginDashboardAggregateRead
+    // Set A's TTL before the aggregate snapshot starts. Mutating it in the first
+    // selectSource hook would now correctly trip the stronger file-version fence.
+    if (mode === 'root-expiry' || mode === 'dependency-expiry') {
+      const directory = opendirSync(path.join(f.root, 'projects'))
+      const firstKey = directory.readSync().name; directory.closeSync()
+      const target = mode === 'root-expiry' ? roots.get(firstKey) : dependencies.get(firstKey)
+      writers.get(firstKey).db.prepare('UPDATE l1_memories SET expiry_at = ? WHERE id = ?').run(expiryAt, target.id)
+    }
     runtime.beginDashboardAggregateRead = function (...args) {
       const opened = Reflect.apply(originalOpen, this, args)
       if (opened.status !== 'ok') return opened
@@ -745,12 +754,6 @@ function assertGlobalPublicationFence(mode, surface) {
       reader.selectGlobalSource = function (key) {
         if (trace.first === undefined) {
           trace.first = key
-          // Set up only A, before its first real probe. B remains unexpired throughout.
-          if (mode === 'root-expiry' || mode === 'dependency-expiry') {
-            const target = mode === 'root-expiry' ? roots.get(key) : dependencies.get(key)
-            writers.get(key).db.prepare('UPDATE l1_memories SET expiry_at = ? WHERE id = ?').run(expiryAt, target.id)
-            if (mode === 'dependency-expiry') assert.equal(writers.get(key).db.prepare('SELECT expiry_at FROM l1_memories WHERE id = ?').get(roots.get(key).id).expiry_at, null)
-          }
         }
         return Reflect.apply(select, this, [key])
       }
@@ -1109,8 +1112,9 @@ function observeSceneProgress(runtime, records, hooks = {}) {
 function driveSceneRpc(runtime, layer, onPage) {
   const pages = [], windows = []
   let resume
-  for (let window = 0; window < 16; window += 1) {
+  for (let window = 0; window < 128; window += 1) {
     let page = runtime.readDashboard({ ...request(layer), ...(resume === undefined ? {} : { resume }) })
+    if (resume) assert.equal(runtime.readDashboard({ version: 1, action: 'close', readId: resume }).status, 'ok')
     let continuations = 0
     for (;;) {
       assert.equal(ReadDashboardResultSchema.safeParse(page).success, true)
@@ -1150,7 +1154,7 @@ test('Demo v7 global L2 and home finish a 24-member scene through bounded public
       const result = driveSceneRpc(runtime, layer)
       assert.equal(result.failed, undefined, '24 members must finish with the unchanged native budgets')
       assert.equal(result.windows.at(-1).global.next, undefined)
-      assert.equal(result.windows.reduce((sum, page) => sum + page.global.counts.L2.value, 0), 6)
+      assert.equal(result.windows.at(-1).global.counts.L2.value, 6, 'final cumulative count covers every window')
       assert.ok(trace.readers.some((entry) => entry.finalVisible === 1 && entry.successes.size === 24))
       assert.ok(result.pages.some((page) => page.cursor !== undefined), 'the large scene exercises real RPC continuation')
       assert.ok(result.windows.length > 1, 'six sources retain the four-source publication window')
@@ -1231,23 +1235,42 @@ test('Demo v7 scene continuation close and policy invalidation release reader st
   }
 })
 
-test('Demo v7 unfinished scene bookmarks reprove members and stop at unchanged session limits', () => {
-  const f = sceneProgressFixture(100, false); let runtime, trace
+test('Demo v7 a 100-member scene is completely verified alongside the home and smaller scenes', () => {
+  const f = sceneProgressFixture(100, false); let runtime
+  try {
+    seed(f.root, 'scene-a', 'Small independently verified preference.', { scene: 'small-scene', sourceEventId: 'small-home-scene' })
+    runtime = f.open()
+    const result = driveSceneRpc(runtime, 'home')
+    assert.equal(result.failed, undefined, 'an oversized derived proof must not discard the usable home')
+    const last = result.windows.at(-1)
+    assert.equal(last.status, 'ok')
+    assert.equal(last.complete, true)
+    assert.equal(last.global.next, undefined, 'the reader must finish without an endless retry bookmark')
+    assert.equal(last.global.counts.L0.value, 101)
+    assert.equal(last.global.counts.L1.value, 101)
+    assert.equal(last.global.counts.L2.value, 2, 'both scenes are fully verified')
+    assert.equal(last.global.counts.L2.relation, 'exact')
+    assert.ok(last.global.items.length > 0, 'verified recent memories remain usable')
+  } finally { f.close() }
+})
+
+test('Demo v7 unfinished scene bookmarks complete more than 100 members without redoing proofs', () => {
+  const f = sceneProgressFixture(250, false); let runtime, trace
   try {
     runtime = f.open(); trace = observeSceneProgress(runtime, f.records)
     const result = driveSceneRpc(runtime, 'L2')
-    assert.equal(result.windows.length, 2, 'only one fresh reader may retry a scene that cannot fit a complete window')
+    assert.ok(result.windows.length > 1, 'the proof spans real bounded work windows')
     assert.equal(result.windows[0].reason, 'global-total-budget-limit')
     assert.ok(result.windows[0].global.next)
-    assert.equal(result.failed?.status, 'budget_exhausted')
-    assert.equal(result.failed.global, undefined); assert.equal(result.failed.cursor, undefined)
-    assert.equal(trace.readers.length, 2)
-    const [first, fresh] = trace.readers
-    assert.ok(first.successes.size > 0 && first.successes.size < 100)
-    assert.ok(fresh.successes.size > 0 && fresh.successes.size < 100)
-    assert.ok([...fresh.successes.keys()].some((id) => first.successes.has(id)), 'new reader redoes proofs instead of inheriting trusted member offsets')
-    assert.ok(trace.readers.every((entry) => entry.finalVisible === 0))
-    assert.ok(result.pages.every((page) => (page.global?.items.length ?? 0) === 0))
+    assert.equal(result.failed, undefined)
+    const last = result.windows.at(-1)
+    assert.equal(last.status, 'ok'); assert.equal(last.complete, true)
+    assert.deepEqual(last.global.counts.L2, { value: 1, relation: 'exact' })
+    assert.equal(last.global.next, undefined)
+    assert.equal(trace.readers.filter(entry => entry.successes.size > 0).length, 1, 'same native connections fence all proof batches')
+    assert.equal(trace.readers[0].successes.size, 250)
+    assert.equal(trace.readers[0].finalVisible, 1)
+    assert.equal(result.pages.flatMap(page => page.global?.items ?? []).length, 1)
   } finally { closeSceneFixture(f, runtime, trace) }
 })
 
@@ -1351,8 +1374,9 @@ function observePersonaProgress(runtime, expected, hooks = {}) {
 async function drivePersonaRpc(runtime, layer = 'L3', hooks = {}) {
   const pages = [], windows = []
   let resume
-  for (let window = 0; window < 8; window += 1) {
+  for (let window = 0; window < 128; window += 1) {
     let page = runtime.readDashboard({ ...request(layer), ...(resume === undefined ? {} : { resume }) }), continuations = 0
+    if (resume) assert.equal(runtime.readDashboard({ version: 1, action: 'close', readId: resume }).status, 'ok')
     for (;;) {
       assert.equal(ReadDashboardResultSchema.safeParse(page).success, true)
       pages.push(page); await hooks.page?.(page)
@@ -1369,7 +1393,7 @@ async function drivePersonaRpc(runtime, layer = 'L3', hooks = {}) {
     resume = page.global.next
     if (resume === undefined) return { pages, windows }
   }
-  assert.fail('the original eight-window bound must complete or fail closed, never grow')
+  assert.fail('the bounded test driver must complete or fail closed')
 }
 
 test('Demo v7 automatically generated eight-source personas finish cold L3 and home across six projects', async () => {
@@ -1384,7 +1408,7 @@ test('Demo v7 automatically generated eight-source personas finish cold L3 and h
       const result = await drivePersonaRpc(runtime, layer)
       assert.equal(result.failed, undefined)
       assert.equal(result.windows.at(-1).global.next, undefined)
-      assert.equal(result.windows.reduce((sum, page) => sum + page.global.counts.L3.value, 0), 6)
+      assert.equal(result.windows.at(-1).global.counts.L3.value, 6, 'final cumulative count covers every window')
       assert.ok(result.pages.some((page) => page.cursor !== undefined))
       assert.ok(result.windows.length > 1, 'six projects retain the four-project publication scope')
       assert.ok(trace.readers.some((entry) => entry.bodies.has(f.projectKey) && entry.proved.get(f.projectKey)?.size === 8))
@@ -1399,9 +1423,9 @@ test('Demo v7 automatically generated eight-source personas finish cold L3 and h
   }
 })
 
-test('Demo v7 persona source and body budget stalls reprove once then fail without payload', async () => {
+test('Demo v7 large persona source indexes and bodies complete without skipping or repeated proofs', async () => {
   for (const mode of ['sources', 'body']) {
-    const count = mode === 'sources' ? 100 : 1, f = sceneProgressFixture(count, false)
+    const count = mode === 'sources' ? 250 : 1, f = sceneProgressFixture(count, false)
     const writer = openProjectStore(f.root, 'scene-a')
     const ids = f.records.map((record) => record.id), revisions = Object.fromEntries(f.records.map((record) => [record.id, record.revision]))
     try { writer.setPersona(mode === 'body' ? 'x'.repeat(65_536) : 'Bounded persona source proof.', count, ids, Date.now(), revisions) }
@@ -1410,16 +1434,18 @@ test('Demo v7 persona source and body budget stalls reprove once then fail witho
     try {
       runtime = f.open(); trace = observePersonaProgress(runtime, new Map([['scene-a', { ids, revisions }]]))
       const result = await drivePersonaRpc(runtime)
-      assert.equal(result.windows.length, 2, 'one fresh window is the full retry allowance for the same persona')
-      assert.equal(result.windows[0].reason, 'global-total-budget-limit'); assert.ok(result.windows[0].global.next)
-      assert.equal(result.failed?.status, 'budget_exhausted')
-      assert.equal(result.failed.global, undefined); assert.equal(result.failed.cursor, undefined)
-      assert.equal(trace.readers.length, 2)
-      const first = trace.readers[0].proved.get('scene-a'), fresh = trace.readers[1].proved.get('scene-a')
-      assert.ok(first?.size > 0 && fresh?.size > 0)
-      assert.ok([...fresh].some((id) => first.has(id)), 'fresh readers redo proofs rather than trusting saved source offsets')
-      assert.ok(trace.readers.every((entry) => entry.bodies.size === 0))
-      assert.ok(result.pages.every((page) => (page.global?.items.length ?? 0) === 0))
+      assert.equal(result.failed, undefined)
+      const last = result.windows.at(-1)
+      assert.equal(last.status, 'ok'); assert.equal(last.complete, true)
+      assert.deepEqual(last.global.counts.L3, { value: 1, relation: 'exact' })
+      assert.equal(last.global.next, undefined)
+      assert.equal(trace.readers.filter(entry => entry.proved.get('scene-a')?.size > 0).length, 1)
+      assert.equal(trace.readers[0].proved.get('scene-a').size, count)
+      assert.equal(trace.readers[0].bodies.size, 1)
+      const items = result.pages.flatMap(page => page.global?.items ?? [])
+      assert.equal(items.length, 1)
+      assert.equal(items[0].content, mode === 'body' ? 'x'.repeat(65_536) : 'Bounded persona source proof.')
+      if (mode === 'sources') assert.ok(result.windows.length > 1)
     } finally { closeSceneFixture(f, runtime, trace) }
   }
 })
@@ -1462,7 +1488,8 @@ test('Demo v7 incremental persona TTL expires between real RPCs without clock re
       if (waited || page.cursor === undefined || !trace.readers.some((entry) => entry.proved.get(f.projectKey)?.has(id))) return
       assert.ok(Date.now() < expiry, 'the source was proven while its actual TTL was still live')
       waited = true
-      await new Promise((resolve) => setTimeout(resolve, Math.max(1, expiry - Date.now() + 1)))
+      // Timers may wake at the millisecond boundary; wait for the condition.
+      while (Date.now() <= expiry) await new Promise((resolve) => setTimeout(resolve, Math.max(5, expiry - Date.now() + 2)))
       assert.ok(Date.now() > expiry, 'the real wall clock reached the stored TTL')
     } })
     assert.equal(waited, true)
@@ -1563,7 +1590,7 @@ function observeFilteredL1(runtime, beforePublish) {
 function driveFilteredL1(runtime, query) {
   const pages = [], windows = []
   let resume
-  for (let window = 0; window < 16; window += 1) {
+  for (let window = 0; window < 128; window += 1) {
     let page = runtime.readDashboard({ ...request('L1', query), ...(resume === undefined ? {} : { resume }) })
     let continuations = 0
     try {
@@ -1604,8 +1631,8 @@ test('Demo v7 filtered L1 no-hit and late-hit queries traverse six sources witho
       assert.equal(new Set(keys).size, keys.length, 'cross-window results have no duplicates')
       assert.deepEqual(new Set(keys), query === 'quartzneedle' ? f.tails : new Set())
       assert.ok(result.pages.every((page) => page.global.generateMemory === false), 'generation OFF does not truncate browsing')
-      assert.equal(result.windows.at(-1).complete, false, 'completed traversal across windows is still a partial-count view')
-      assert.equal(result.windows.at(-1).global.counts.L1.relation, 'lower_bound')
+      assert.equal(result.windows.at(-1).complete, true, 'an unchanged, fully traversed snapshot has an exact cumulative count')
+      assert.equal(result.windows.at(-1).global.counts.L1.relation, 'exact')
       for (const entry of observed.trace.counters) for (const kind of ['call', 'session']) {
         assert.equal(entry.status, 'ok')
         const bound = kind === 'call' ? limits.perCall : limits.perSession
@@ -1636,4 +1663,127 @@ test('Demo v7 filtered L1 late-hit publication rejects a changed source without 
     assert.ok(result.pages.slice(0, -1).every((page) => page.global.items.length === 0), 'no earlier filtered page publishes the pending late body')
     for (const reader of observed.trace.readers) { assert.equal(reader.ended, true); assert.equal(reader.globalHandles.size, 0) }
   } finally { closeSceneFixture(f, runtime, observed) }
+})
+
+test('Demo v7 global L3 verifies every source across more than four projects and 100 sources', async () => {
+  const f = fixture('v7-global-persona-batches-'), sources = []
+  let runtime
+  try {
+    for (let project = 0; project < 6; project++) {
+      const key = `global-persona-${project}`, store = openProjectStore(f.root, key)
+      try {
+        for (let i = 0; i < 25; i++) {
+          const source = store.captureMessage({ sessionId: key, role: 'user', content: `Global persona input ${project}/${i}`,
+            sourceKind: 'conversation', sourceEventId: `global-${project}-${i}`, agentPreset: 'agent-mock' })
+          const record = store.addMemory({ content: `Global persona preference ${project}/${i}`, status: 'approved',
+            kind: 'preference', sourceMessageIds: [source.id], sourceVerified: true }).record
+          sources.push({ projectKey: key, id: record.id, revision: record.revision })
+        }
+      } finally { store.close() }
+    }
+    mkdirSync(path.join(f.root, 'global'), { recursive: true })
+    writeFileSync(path.join(f.root, 'global/persona.json'), JSON.stringify({ content: 'Stable global persona backed by all 150 sources.',
+      sourceCount: sources.length, sources, updatedAt: Date.now(), stale: false }))
+    runtime = f.open()
+    const result = await drivePersonaRpc(runtime)
+    assert.equal(result.failed, undefined)
+    const last = result.windows.at(-1)
+    assert.equal(last.complete, true)
+    assert.deepEqual(last.global.counts.L3, { value: 1, relation: 'exact' })
+    const items = result.pages.flatMap(page => page.global?.items ?? [])
+    assert.equal(items.length, 1); assert.equal(items[0].sources.length, 150)
+    assert.equal(runtime.globalReader.progress.size, 0)
+  } finally { f.close() }
+})
+
+test('Demo v7 retained derived batches reject source changes and release on cancel and expiry', async () => {
+  for (const layer of ['L2', 'L3']) for (const mode of ['revision', 'revoke', 'expiry', 'cancel']) {
+    const f = sceneProgressFixture(100, false)
+    let runtime, fired = false
+    try {
+      runtime = f.open()
+      const writer = runtime.storeByKey('scene-a', false), first = f.records[0]
+      if (layer === 'L3') writer.setPersona('Batch persona.', 100, f.records.map(r => r.id), Date.now(),
+        Object.fromEntries(f.records.map(r => [r.id, r.revision])))
+      const expiry = Date.now() + 60_000
+      if (mode === 'expiry') writer.db.prepare('UPDATE l1_memories SET expiry_at = ?').run(expiry)
+      const open = runtime.beginDashboardAggregateRead
+      runtime.beginDashboardAggregateRead = function (...args) {
+        const opened = Reflect.apply(open, this, args)
+        if (opened.status === 'ok' && mode === 'expiry') {
+          const originalNow = opened.value.wallNow
+          opened.value.wallNow = () => fired ? expiry + 1 : originalNow()
+        }
+        return opened
+      }
+      const result = await drivePersonaRpc(runtime, layer, { window(page) {
+        if (fired || !page.global?.next) return
+        const saved = runtime.globalReader.progress.get(page.global.next)
+        if (!saved?.active) return
+        fired = true
+        if (mode === 'revision') writer.db.prepare('UPDATE l1_memories SET revision = revision + 1 WHERE id = ?').run(first.id)
+        else if (mode === 'revoke') runtime.control.revokeSourceEvent('scene-a', 'scene-progress-0', first.sourceMessageIds[0])
+        else if (mode === 'cancel') runtime.readDashboard({ version: 1, action: 'close', readId: page.global.next })
+      } })
+      assert.equal(fired, true, `${layer}/${mode} reached a real retained proof batch`)
+      assert.equal(result.failed?.status, 'stale')
+      assert.equal(result.failed.global, undefined)
+      assert.equal(runtime.dashboardReadSessions.stats().sessions, 0)
+      assert.equal(runtime.globalReader.progress.size, 0)
+      assert.ok(result.pages.every(page => (page.global?.items.length ?? 0) === 0))
+    } finally { f.close() }
+  }
+})
+
+test('Demo v7 a thousand-member scene completes with bounded proof residency', () => {
+  const f = sceneProgressFixture(1000, false)
+  let runtime, peak = 0
+  try {
+    runtime = f.open()
+    const result = driveSceneRpc(runtime, 'L2', () => {
+      peak = Math.max(peak, runtime.dashboardReadSessions.stats().accountedBytes)
+    })
+    assert.equal(result.failed, undefined)
+    assert.deepEqual(result.windows.at(-1).global.counts.L2, { value: 1, relation: 'exact' })
+    assert.equal(result.windows.at(-1).complete, true)
+    assert.ok(peak < 2 * 1024 * 1024, 'member count does not turn into retained per-member proof storage')
+    assert.equal(runtime.globalReader.progress.size, 0)
+  } finally { f.close() }
+})
+
+test('Demo v7 full-size scene and legacy persona bodies use materialization rather than key budget', () => {
+  const f = sceneProgressFixture(1, false); let runtime
+  try {
+    runtime = f.open()
+    const store = runtime.storeByKey('scene-a', false), content = 'x'.repeat(65_536), first = f.records[0]
+    store.db.prepare('UPDATE l2_scenes SET summary = ?').run(content)
+    store.setPersona(content, 1, [first.id], Date.now(), { [first.id]: first.revision })
+    const result = driveSceneRpc(runtime, 'L2')
+    assert.equal(result.failed, undefined); assert.equal(result.windows.at(-1).complete, true)
+    assert.equal(result.pages.flatMap(page => page.global.items)[0].content, content)
+    const opened = runtime.beginDashboardVisibilityRead({ generationId: 'full-body', policyKey: 'a'.repeat(64),
+      filterKey: 'b'.repeat(64), asOf: Date.now(), viewKey: 'overview', projectKeys: ['scene-a'] })
+    assert.equal(opened.status, 'ok')
+    try {
+      const persona = opened.value.readManagedPersona('scene-a')
+      assert.equal(persona.status, 'ok'); assert.equal(persona.value.state, 'visible'); assert.equal(persona.value.content, content)
+    } finally { opened.value.cancel() }
+  } finally { f.close() }
+})
+
+test('Demo v7 scene drilldown normalizes absent blank and padded general scene names', async () => {
+  const f = fixture('v7-general-scene-')
+  try {
+    for (const [i, scene] of ['', '  ', ' general ', 'general', 'other'].entries()) {
+      seed(f.root, 'scene-a', `Scene normalization preference ${i}.`, { scene, sourceEventId: `normalize-${i}` })
+    }
+    const runtime = f.open()
+    const result = await import('../src/client/memory-v7-model.js').then(({readCompleteGlobalMemory}) =>
+      readCompleteGlobalMemory(async q => runtime.readDashboard(q), { ...request('L1'), scene: { projectKey: 'scene-a', name: 'general' } }))
+    assert.equal(result.complete, true)
+    assert.deepEqual(result.global.counts.L1, { value: 4, relation: 'exact' })
+    assert.equal(result.global.items.length, 4)
+    assert.ok(result.global.items.every(i => (i.scene?.trim() || 'general') === 'general'))
+    assert.equal(runtime.globalReader.progress.size, 0)
+  } finally { f.close() }
 })

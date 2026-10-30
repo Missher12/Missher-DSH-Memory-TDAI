@@ -1436,9 +1436,11 @@ export class DashboardAggregateService {
           fdStat.dev === openedDirectory!.dev && fdStat.ino === openedDirectory!.ino
       } catch { return false }
     }
-    // Resolve the leaf through the already-bound directory fd; O_NOFOLLOW still
-    // protects the final component from symlink substitution.
-    const file = path.join('/proc/self/fd', String(directoryFd!), 'persona.json')
+    // Linux can resolve through the bound directory fd. Other hosts use the
+    // verified directory path and recheck its identity around the bounded read.
+    const file = process.platform === 'linux'
+      ? path.join('/proc/self/fd', String(directoryFd!), 'persona.json')
+      : path.join(directory, 'persona.json')
     let before: Stats | undefined
     try { before = lstatSync(file, { throwIfNoEntry: false }) } catch {
       try { closeSync(directoryFd!) } catch { /* unreadable directory path */ }
@@ -1465,7 +1467,7 @@ export class DashboardAggregateService {
       try { opened = fstatSync(fd) } catch {
         return this.abortState(state, 'unavailable-probe', 'global-persona-file-unreadable', 'globalPersona')
       }
-      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      if (!directoryBound() || !opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
         return this.abortState(state, 'stale', 'global-persona-file-changed', 'globalPersona')
       }
       const lease = state.reader.reserveReadState(256 * 1024)

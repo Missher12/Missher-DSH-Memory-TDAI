@@ -18,6 +18,8 @@ import { MemoryRuntime } from './memory.js'
 import { resolveMemoryRoot } from './project.js'
 import { MemoryTdaiRemote } from './remote.js'
 import { registerMemoryTools } from './tools.js'
+import { estimateTokens } from './tokens.js'
+import { isConversationSource } from './r41.js'
 
 export const name = 'memory-tdai'
 
@@ -29,7 +31,7 @@ export function apply(ctx: HostContextLike, rawConfig?: MemoryTdaiConfig): void 
   const config = resolveConfig(rawConfig)
   if (!config.enabled) return
 
-  const runtime = new MemoryRuntime(ctx, config, resolveMemoryRoot(config.dataDir, dshHomeOf(ctx)))
+  const runtime = new MemoryRuntime(ctx, config, resolveMemoryRoot(config.dataDir, dshHomeOf(ctx), profileDirectoryOf(ctx)))
   ctx.effect(() => () => runtime.close(), 'memory-tdai.close')
 
   // The Settings dashboard talks to this pathless service; the client bundle
@@ -109,14 +111,20 @@ export function apply(ctx: HostContextLike, rawConfig?: MemoryTdaiConfig): void 
       .find(
         (message) =>
           message.role === 'user' &&
-          message.source?.kind !== 'memory' &&
-          message.source?.kind !== 'runtime-context' &&
+          isConversationSource(message.source?.kind, 'user') &&
           textOfMessage(message).trim() !== '',
       )
-    if (userMessage === undefined && previousMemoryMessages.length === 0) return decision
-    const block = userMessage === undefined ? undefined : runtime.globalRecall(textOfMessage(userMessage), session)
-    if (block === undefined) return retainedMessages.length === baseMessages.length ? decision : { ...decision, messages: retainedMessages }
-    const memoryMessage = createMemoryMessage(block)
+    const block = userMessage === undefined
+      ? undefined
+      : runtime.globalRecall(textOfMessage(userMessage), session, runtime.characterReservation(session))
+    // Learned expression gets a bounded reservation; remaining capacity belongs
+    // to facts. Re-read style last so recall cannot invalidate its source proof.
+    const remainingTokens = config.recall.maxTokens - estimateTokens(block ?? '')
+    const remainingChars = config.recall.maxChars > 0 ? config.recall.maxChars - (block?.length ?? 0) - (block ? 1 : 0) : undefined
+    const guidance = runtime.characterGuidance(session, remainingTokens - (block ? 1 : 0), remainingChars)
+    const combined = [block, guidance].filter((text): text is string => text !== undefined && text !== '').join('\n')
+    if (combined === '') return retainedMessages.length === baseMessages.length ? decision : { ...decision, messages: retainedMessages }
+    const memoryMessage = createMemoryMessage(combined)
     return {
       ...decision,
       messages: [...retainedMessages, memoryMessage],
@@ -204,4 +212,13 @@ function dshHomeOf(ctx: HostContextLike): string | undefined {
     // The optional path service may not be mounted.
   }
   return undefined
+}
+
+function profileDirectoryOf(ctx: HostContextLike): string | undefined {
+  let profile: unknown
+  try { profile = ctx.get('profileContext') } catch { return undefined }
+  if (profile == null) return undefined
+  const directory = typeof profile === 'object' ? (profile as { dir?: unknown }).dir : undefined
+  if (typeof directory !== 'string' || directory.trim() === '') throw new Error('Host profileContext has no directory')
+  return directory
 }

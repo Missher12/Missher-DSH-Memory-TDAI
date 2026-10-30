@@ -73,3 +73,13 @@ test('a non-empty array whose items are all damaged is not a legal empty result'
   assert.equal(mixed.ok, true)
   if (mixed.ok) assert.equal(mixed.memories.length, 1)
 })
+test('extraction preserves all source IDs and rejects oversized results instead of silently dropping tails', () => {
+  const ids = Array.from({ length: 24 }, (_, i) => `source-${i}`)
+  const memory = { content: 'A preference supported by the complete input batch.', source_message_ids: ids }
+  const parsed = parseExtractionJson(JSON.stringify({ memories: [memory] }))
+  assert.equal(parsed.ok, true); assert.deepEqual(parsed.memories[0].sourceMessageIds, ids)
+  assert.deepEqual(parseExtractionJson(JSON.stringify({ memories: Array.from({ length: 51 }, () => memory) })),
+    { ok: false, reason: 'invalid-items' })
+  assert.deepEqual(parseExtractionJson(JSON.stringify({ memories: [{ ...memory, source_message_ids: [...ids, null] }] })),
+    { ok: false, reason: 'invalid-items' })
+})

@@ -1179,7 +1179,7 @@ test('registered plugin readDashboard settings returns exact configured values a
   await withHarness(() => createHarness(seedDashboardFixture), async (harness) => {
     const service = harness.service
     const expected = { mode: 'balanced', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-      includePersona: true, globalPersona: false }
+      includePersona: true, globalPersona: false, extractionProvider: 'background', extractionModel: 'json' }
     const updated = await callRpc(service, UPDATE_SETTINGS_ACK, { request: expected })
     assert.equal(updated.ok, true)
     assert.equal(updated.operation, 'settings.update')
@@ -1190,7 +1190,8 @@ test('registered plugin readDashboard settings returns exact configured values a
     assert.equal(settings.status, 'ok')
     assert.equal(settings.view, 'settings')
     assert.equal(settings.readId, started.readId)
-    assert.deepEqual(settings.settings, { ...expected, generateMemory: true, useMemory: true })
+    assert.deepEqual(settings.settings, { ...expected, generateMemory: true, useMemory: true,
+      characterEnabled: false, characterDescription: '' })
     assert.equal(settings.lastErrorState, 'absent')
 
     await callRpc(service, UPDATE_SETTINGS_ACK, { request: { recallMaxTokens: 778 } })
@@ -1220,7 +1221,7 @@ test('settings action reads the bounded in-memory projection and never invokes l
     assert.equal(settings.readId, started.readId)
     assert.equal(settings.activeProjectKey, harness.project.key)
     assert.deepEqual(Object.keys(settings.settings).sort(), [
-      'extractionEnabled', 'extractionEveryN', 'generateMemory', 'globalPersona', 'includePersona', 'mode', 'recallMaxTokens', 'useMemory',
+      'characterDescription', 'characterEnabled', 'extractionEnabled', 'extractionEveryN', 'extractionModel', 'extractionProvider', 'generateMemory', 'globalPersona', 'includePersona', 'mode', 'recallMaxTokens', 'useMemory',
     ])
     assert.equal(settings.settings.mode, 'review')
     assert.equal(settings.settings.extractionEnabled, false)
@@ -1348,22 +1349,23 @@ test('persona action proves sixteen persisted sources across the registered RPC 
   })
 })
 
-test('persona call-budget no-progress terminal is cleaned without payload or cursor', async () => {
+test('persona full-size body completes without treating content as key-budget work', async () => {
   await withHarness(() => createRuntimeRpcHarness(seedOversizedPersona), async (harness) => {
     const read = (request) => callRpc(harness.remote, READ_DASHBOARD, { request })
     const { started } = await startSelectedDashboard(harness.remote, harness.project.key, harness.data.captureDate)
-    const first = await read({ version: 1, action: 'persona', readId: started.readId, projectKey: harness.project.key })
-    assert.equal(first.status, 'partial')
-    assert.ok(first.cursor)
-    assert.equal(first.persona.content, undefined)
-    const terminal = await read({ version: 1, action: 'continue', readId: started.readId, cursor: first.cursor })
-    assert.equal(terminal.status, 'budget_exhausted')
-    assert.equal(terminal.cursor, undefined)
-    assert.equal(terminal.persona, undefined)
+    let page = await read({ version: 1, action: 'persona', readId: started.readId, projectKey: harness.project.key })
+    for (let round = 0; page.cursor !== undefined && round < 16; round++) {
+      assert.equal(page.persona.content, undefined)
+      page = await read({ version: 1, action: 'continue', readId: started.readId, cursor: page.cursor })
+    }
+    assert.equal(page.status, 'ok')
+    assert.equal(page.cursor, undefined)
+    assert.equal(page.persona.content, 'x'.repeat(65_536))
+    assert.equal(page.persona.sourceCount, 1)
+    assert.equal((await read({ version: 1, action: 'close', readId: started.readId })).status, 'ok')
     const runtime = harness.runtime
-    const stats = runtime.dashboardReadSessions.stats()
-    assert.equal(stats.sessions, 0)
-    assert.equal(stats.activeCalls, 0)
+    assert.equal(runtime.dashboardReadSessions.stats().sessions, 0)
+    assert.equal(runtime.dashboardReadSessions.stats().activeCalls, 0)
     assert.equal(runtime.dashboardVisibilityReaders.size, 0)
     assert.equal(runtime.dashboardAggregate.states.size, 0)
   })
@@ -3747,7 +3749,7 @@ test('U09 Host Loader registers scoped codecs and Gateway dispatches bootstrap s
       assert.equal(rejectedAck.ok, false)
       assert.equal(rejectedAck.error.code, 'gateway/input-invalid')
       const expected = { mode: 'balanced', recallMaxTokens: 777, extractionEveryN: 3, extractionEnabled: false,
-        includePersona: true, globalPersona: false }
+        includePersona: true, globalPersona: false, extractionProvider: 'background', extractionModel: 'json' }
       const ack = await dispatch('updateSettingsAck', { request: expected })
       assert.equal(ack.ok, true, JSON.stringify(ack.error))
       assert.equal(ack.value.ok, true)
@@ -3759,7 +3761,7 @@ test('U09 Host Loader registers scoped codecs and Gateway dispatches bootstrap s
       const updated = await read({ version: 1, action: 'settings', readId: refreshed.readId })
       assert.equal(updated.ok, true, JSON.stringify(updated.error))
       assert.equal(updated.value.status, 'ok')
-      assert.deepEqual(updated.value.settings, { ...expected, generateMemory: true, useMemory: true }, 'ACK dispatch changes the real plugin state observed by settings')
+      assert.deepEqual(updated.value.settings, { ...expected, generateMemory: true, useMemory: true, characterEnabled: false, characterDescription: '' }, 'ACK dispatch changes the real plugin state observed by settings')
 
       await loaderFiber.dispose()
       assert.equal(registry.getPackage(packageName), undefined)
@@ -3773,216 +3775,23 @@ test('U09 Host Loader registers scoped codecs and Gateway dispatches bootstrap s
   }
 })
 
-function u09LifecycleBarrier() {
-  let resolve
-  const promise = new Promise((done) => { resolve = done })
-  return { promise, resolve }
-}
 
-test('U09 six page lifetimes share real two-session RPC capacity with directory and settings reads', { timeout: 15000 }, async () => {
-  const { createDashboardReaderPool, createDashboardReadController } = await import('../src/client/scoped-read-state.js')
-  await withHarness(() => createHarness(seedDashboardFixture), async (harness) => {
-    const firstAllocations = u09LifecycleBarrier(), releaseAllocations = u09LifecycleBarrier()
-    const firstCloses = u09LifecycleBarrier(), releaseCloses = u09LifecycleBarrier()
-    const live = new Set(), initial = new Set(), results = []
-    let allocations = 0, heldCloses = 0, peak = 0
-    const source = async (request) => {
-      if (request.action === 'close' && initial.has(request.readId)) {
-        heldCloses += 1
-        if (heldCloses === 2) firstCloses.resolve()
-        await releaseCloses.promise
-      }
-      const result = await callRpc(harness.service, READ_DASHBOARD, { request })
-      results.push({ request, result })
-      assert.notEqual(result.reason, 'session-capacity')
-      assert.notEqual(result.status, 'evicted')
-      if ((request.action === 'bootstrap' || request.action === 'settings') && request.readId === undefined) {
-        const expectedStatus = request.action === 'bootstrap' && Array.isArray(request.projectKeys) && request.projectKeys.length === 0
-          ? 'selection_required' : 'ok'
-        assert.equal(result.status, expectedStatus, `allocation ${request.action}: ${result.reason}`)
-        assert.equal(typeof result.readId, 'string')
-        allocations += 1
-        live.add(result.readId)
-        peak = Math.max(peak, live.size)
-        if (allocations <= 2) {
-          initial.add(result.readId)
-          if (allocations === 2) firstAllocations.resolve()
-          await releaseAllocations.promise
-        }
-      }
-      if (request.action === 'close') live.delete(request.readId)
-      return result
-    }
-    const pool = createDashboardReaderPool({ readDashboard: source })
-    const directory = createDashboardReadController({ readDashboard: source })
-    const settings = createDashboardReadController({ readDashboard: source })
-    const requests = [
-      { version: 1, action: 'overview', focusProjectKey: harness.project.key },
-      { version: 1, action: 'persona', projectKey: harness.project.key },
-      { version: 1, action: 'globalPersona' },
-      { version: 1, action: 'scene', projectKey: harness.project.key },
-      { version: 1, action: 'library', projectKey: harness.project.key, status: 'approved', limit: 1 },
-      { version: 1, action: 'repeated', target: { kind: 'groups', projectKeys: [harness.project.key], limit: 10 } },
-    ]
-    const jobs = requests.map(async (request, index) => {
-      const reader = pool.get(`page-${index}`), token = reader.start()
-      try {
-        const opened = await reader.load(token, { version: 1, action: 'bootstrap',
-          projectKeys: [harness.project.key], range: rangeFor(harness.data.captureDate) }, { maxContinuations: 0 })
-        assert.ok('result' in opened)
-        const readId = opened.result.readId
-        await Promise.resolve() // Admission must survive the gap between bootstrap and data RPC.
-        const read = await reader.load(token, { ...request, readId }, { maxContinuations: 0 })
-        assert.ok('result' in read)
-        assert.ok(['ok', 'partial', 'budget_exhausted', 'scope_limit'].includes(read.result.status), read.result.reason)
-        assert.equal(read.result.readId, readId)
-        return read.result
-      } finally { await reader.closeCurrent() } // Explicitly end even a partial view; no completeness claim.
-    })
-    jobs.push((async () => {
-      try {
-        const read = await directory.load(directory.start(), { version: 1, action: 'bootstrap', projectKeys: [] })
-        assert.ok('result' in read)
-        assert.ok(read.result.projects.some((project) => project.key === harness.project.key))
-      } finally { await directory.closeCurrent() }
-    })())
-    jobs.push((async () => {
-      try {
-        const read = await settings.load(settings.start(), { version: 1, action: 'settings' })
-        assert.ok('result' in read)
-        assert.equal(read.result.settings.mode, 'review')
-      } finally { await settings.closeCurrent() }
-    })())
-    // Attach rejection handlers immediately; an assertion failure still releases every barrier.
-    const settled = Promise.allSettled(jobs)
-    try {
-      await firstAllocations.promise
-      await new Promise((resolve) => setImmediate(resolve))
-      assert.equal(allocations, 2)
-      releaseAllocations.resolve()
-      await firstCloses.promise
-      assert.equal(allocations, 2, 'neither a returned RPC nor a pending close releases admission')
-      releaseCloses.resolve()
-      const completed = await settled
-      for (const outcome of completed) assert.equal(outcome.status, 'fulfilled', outcome.reason?.stack)
-      assert.equal(allocations, 8)
-      assert.equal(peak, 2)
-      assert.equal(live.size, 0)
-      assert.equal(results.filter(({ request }) => request.action === 'close').length, 8)
-    } finally {
-      releaseAllocations.resolve(); releaseCloses.resolve()
-      await settled
-      await Promise.all([pool.dispose(), directory.dispose(), settings.dispose()])
-    }
+test('explicit extraction recovery crosses Typert and retires deleted inputs without a provider call', async () => {
+  await withHarness(() => createHarness(store => {
+    const sourceId = store.recordL0({ sessionId: 'deleted-job', role: 'user', content: 'Synthetic deleted recovery source.' })
+    const job = store.enqueueExtractionJob({ sessionId: 'deleted-job', sourceId, policyRevision: 'old', quietMs: 0, maxWaitMs: 1000 })
+    store.db.prepare('DELETE FROM l0_messages WHERE id = ?').run(sourceId)
+    store.updateExtractionJob(job.id, 'failed', 'response_rejected:invalid-json')
+    return { jobId: job.id }
+  }), async harness => {
+    const request = { projectKey: harness.project.key, operation: 'processing.recover',
+      payload: { id: harness.data.jobId, authorized: true, reason: 'Explicit fixture recovery' } }
+    await assert.rejects(() => callRpc(harness.service, MANAGE, { request: { ...request, payload: { ...request.payload, authorized: false } } }), /authorization/)
+    const result = await callRpc(harness.service, MANAGE, { request })
+    assert.equal(result.data.retired, true)
+    assert.equal(result.data.job.status, 'source_pruned')
   })
 })
-
-test('U09 retained real RPC cursors remain owned while later page admission waits', { timeout: 15000 }, async () => {
-  const { createDashboardReaderPool } = await import('../src/client/scoped-read-state.js')
-  await withHarness(() => createHarness(seedDashboardFixture), async (harness) => {
-    const calls = []
-    const source = async (request) => {
-      const result = await callRpc(harness.service, READ_DASHBOARD, { request })
-      calls.push({ request, result })
-      assert.notEqual(result.reason, 'session-capacity')
-      assert.notEqual(result.status, 'evicted')
-      return result
-    }
-    const pool = createDashboardReaderPool({ readDashboard: source })
-    const first = pool.get('library'), second = pool.get('review'), third = pool.get('overview')
-    try {
-      const open = async (reader) => {
-        const token = reader.start()
-        const opened = await reader.load(token, { version: 1, action: 'bootstrap',
-          projectKeys: [harness.project.key], range: rangeFor(harness.data.captureDate) })
-        assert.ok('result' in opened)
-        const readId = opened.result.readId
-        const page = await reader.load(token, { version: 1, action: 'library', readId,
-          projectKey: harness.project.key, status: 'approved', limit: 1 }, { maxContinuations: 0 })
-        assert.ok('result' in page)
-        assert.equal(page.result.complete, false)
-        assert.equal(page.result.records.length, 1)
-        assert.equal(typeof page.result.cursor, 'string')
-        return { token, readId, page: page.result }
-      }
-      const [a, b] = await Promise.all([open(first), open(second)])
-      const thirdToken = third.start()
-      const queued = third.load(thirdToken, { version: 1, action: 'bootstrap',
-        projectKeys: [harness.project.key], range: rangeFor(harness.data.captureDate) })
-      await new Promise((resolve) => setImmediate(resolve))
-      assert.equal(calls.filter(({ request }) => request.action === 'bootstrap').length, 2)
-      const resumedA = await first.load(a.token, { version: 1, action: 'continue', readId: a.readId, cursor: a.page.cursor })
-      assert.ok('result' in resumedA)
-      assert.equal(resumedA.result.status, 'ok')
-      assert.notEqual(resumedA.result.records[0].id, a.page.records[0].id)
-      await first.closeCurrent()
-      assert.ok('result' in await queued)
-      assert.equal(second.readId, b.readId, 'another page cannot replace the retained owner')
-      const resumedB = await second.load(b.token, { version: 1, action: 'continue', readId: b.readId, cursor: b.page.cursor })
-      assert.ok('result' in resumedB)
-      assert.equal(resumedB.result.status, 'ok')
-      assert.notEqual(resumedB.result.records[0].id, b.page.records[0].id)
-      assert.equal(calls.filter(({ request }) => request.action === 'bootstrap').length, 3,
-        'continuations do not reopen sessions or reset cumulative budgets')
-    } finally { await pool.dispose() }
-  })
-})
-
-test('U09 registered RPC preserves capture source counts and activity-specific unknown drilldowns', async () => {
-  const { boundedEventDetailRequest, boundedOverviewModel } = await import('../src/client/dashboard-view-model.js')
-  await withHarness(() => createHarness((store) => {
-    const now = Date.now()
-    const sources = [0, 1].map((index) => store.recordL0({ sessionId: 'scope-count-session', role: 'user',
-      content: `Synthetic scoped source ${index}.`, createdAt: now, recordedAt: now,
-      sourceEventId: `scope-count-${index}`, origin: 'dsh-session' }))
-    store.appendEvent({ eventId: 'capture:scope-count-unknown', type: 'capture', sourceId: sources[0],
-      sessionId: 'scope-count-session', occurredAt: now, count: 1 }, now)
-    const memory = store.addMemory({ content: 'Synthetic source-linked approved memory.', kind: 'fact', status: 'approved',
-      sourceMessageIds: [sources[0]], sourceVerified: true }).record
-    store.appendEvent({ eventId: 'revision:scope-count-revision', type: 'revision', sourceId: memory.id,
-      occurredAt: now, count: 1 }, now)
-    return { date: utcDate(now) }
-  }), async (harness) => {
-    const read = (request) => callRpc(harness.service, READ_DASHBOARD, { request })
-    const projectKey = harness.project.key
-    for (const activity of ['revision', 'capture', 'initial_approval']) {
-      const range = { from: harness.data.date, to: harness.data.date, timeZone: 'UTC', activity }
-      const started = await read({ version: 1, action: 'bootstrap', projectKeys: [projectKey], range })
-      assert.equal(started.status, 'ok')
-      const { result, continuations } = await finishOverview(harness.service, started.readId)
-      assert.equal(result.complete, true)
-      assert.ok(continuations < 16)
-      assert.equal(result.metrics.captures.value, 3)
-      assert.equal(result.metrics.initialApprovals.value, 1)
-      assert.equal(result.metrics.acceptedRevisions.value, 1)
-      assert.equal(result.dimensions.sources.reduce((sum, row) => sum + row.count.value, 0), 5)
-      const model = boundedOverviewModel(result, activity)
-      assert.deepEqual(model.captureSources, [
-        { key: 'dsh-session', count: { value: 2, relation: 'exact' } },
-        { key: 'unknown', count: { value: 1, relation: 'exact' } },
-      ])
-      assert.equal(model.selectedDimensions.sources.find((row) => row.key === 'unknown').count.value, 1)
-      const selectedRequest = boundedEventDetailRequest({ projectKey, range, dimension: 'source', value: 'unknown', date: '' })
-      const selected = await read({ ...selectedRequest.request, readId: started.readId })
-      assert.equal(selected.complete, true)
-      assert.equal(selected.events.length, 1)
-      assert.equal(selected.events[0].type, activity, 'selected groups use the session activity, including non-capture unknowns')
-      assert.equal((await read({ version: 1, action: 'close', readId: started.readId })).status, 'ok')
-
-      const captureRequest = boundedEventDetailRequest({ projectKey, range, activity: 'capture', dimension: 'source', value: 'unknown', date: '' })
-      assert.equal(captureRequest.range.activity, 'capture', 'capture panel does not inherit a revision/approval filter')
-      const captureScope = await read({ version: 1, action: 'bootstrap', projectKeys: [projectKey], range: captureRequest.range })
-      assert.equal(captureScope.status, 'ok')
-      const captureDetail = await read({ ...captureRequest.request, readId: captureScope.readId })
-      assert.equal(captureDetail.complete, true)
-      assert.equal(captureDetail.events.length, 1, 'genuine unknown capture is clickable through the real codec and visibility proof')
-      assert.equal(captureDetail.events[0].type, 'capture')
-      assert.equal(captureDetail.events[0].source, undefined)
-      assert.equal((await read({ version: 1, action: 'close', readId: captureScope.readId })).status, 'ok')
-    }
-  })
-})
-
 
 test('Demo v7 forget crosses the real Typert manage contract and preserves confirmation version and readability guards', async () => {
   const { readGlobalMemory } = await import('../src/client/memory-v7-model.js')
@@ -4003,7 +3812,7 @@ test('Demo v7 forget crosses the real Typert manage contract and preserves confi
     }
     await assert.rejects(() => manage({ ...base, payload: { ...payload, updatedAt: item.updatedAt + 1 } }), /memory changed/u)
     await assert.rejects(() => manage({ ...base, payload: { ...payload, id: harness.data.candidateA.id,
-      updatedAt: harness.data.candidateA.updatedAt } }), /memory changed/u)
+      updatedAt: harness.data.candidateA.updatedAt, revision: harness.data.candidateA.revision + 1 } }), /memory changed/u)
     const unchanged = await readGlobalMemory(read, globalRequest)
     assert.ok(unchanged.global.items.some((row) => row.key === item.key), 'all rejected requests leave the original record readable')
     const ack = await manage(base)

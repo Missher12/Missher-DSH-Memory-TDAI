@@ -5,7 +5,7 @@
 import TYPERT_REMOTE from '../typert.remote-client.js'
 import { Dashboard, type DashboardActions } from './Dashboard.js'
 import type {
-  OverviewRequest, ReadDashboardRequest, ReadDashboardAck, UpdateSettingsRequest,
+  ReadDashboardRequest, ReadDashboardAck, UpdateSettingsRequest,
 } from '../remote-contract.js'
 
 export const inject = ['slots', 'remote']
@@ -13,41 +13,20 @@ export const inject = ['slots', 'remote']
 export async function apply(ctx: any): Promise<() => Promise<void>> {
   const unmountRemote = await ctx.remote.$mount(TYPERT_REMOTE)
   const remote = ctx.get('remote.memoryTdai') as {
-    snapshot: () => Promise<unknown>
-    review: (request: { projectKey: string; id: string; action: 'approve' | 'forget' }) => Promise<unknown>
-    reviewAck: (request: { projectKey: string; id: string; action: 'approve' | 'forget' }) => Promise<unknown>
-    refreshPersonaAck: (request: { projectKey: string }) => Promise<unknown>
-    refreshGlobalPersonaAck: () => Promise<unknown>
-    updateSettings: (request: Record<string, unknown>) => Promise<unknown>
     updateSettingsAck: (request: UpdateSettingsRequest) => Promise<ReadDashboardAck>
     readDashboard: (request: ReadDashboardRequest) => Promise<unknown>
-    export: (request: { projectKey: string }) => Promise<unknown>
-    refreshPersona: (request: { projectKey: string }) => Promise<unknown>
-    refreshGlobalPersona: () => Promise<unknown>
-    overview: (request: OverviewRequest) => Promise<unknown>
-    explain: (request: { projectKey: string; query: string; limit?: number }) => Promise<unknown>
-    library: (request: { projectKey: string; status?: 'candidate' | 'approved' | 'forgotten'; after?: { createdAt: number; id: string }; limit?: number }) => Promise<unknown>
     manage: (request: { projectKey: string; operation: string; payload?: Record<string, unknown> }) => Promise<unknown>
   }
   const unwrap = (result: any): any => {
     if (result?.ok === true) return result.value
-    throw new Error(result?.failure?.code ?? 'memory operation failed')
+    // The native SDK returns RemoteResult.error; preserve its code and cause.
+    const error = result?.error ?? new Error('memory operation failed')
+    ctx.logger?.warn?.('[memory-tdai] Remote request failed: %s %s', error.code ?? '', error.message ?? '')
+    throw error
   }
   const actions: DashboardActions = {
-    load: async () => unwrap(await remote.snapshot()),
-    review: async (request) => unwrap(await remote.review(request)),
-    reviewAck: async (request) => unwrap(await remote.reviewAck(request)),
-    refreshPersonaAck: async (projectKey) => unwrap(await remote.refreshPersonaAck({ projectKey })),
-    refreshGlobalPersonaAck: async () => unwrap(await remote.refreshGlobalPersonaAck()),
-    updateSettings: async (request) => unwrap(await remote.updateSettings(request)),
     updateSettingsAck: async (request) => unwrap(await remote.updateSettingsAck(request)),
     readDashboard: async (request) => unwrap(await remote.readDashboard(request)),
-    exportProject: async (projectKey) => unwrap(await remote.export({ projectKey })),
-    refreshPersona: async (projectKey) => unwrap(await remote.refreshPersona({ projectKey })),
-    refreshGlobalPersona: async () => unwrap(await remote.refreshGlobalPersona()),
-    overview: async (request) => unwrap(await remote.overview(request)),
-    explain: async (request) => unwrap(await remote.explain(request)),
-    library: async (request) => unwrap(await remote.library(request)),
     manage: async (request) => unwrap(await remote.manage({ ...request, payload: request.payload ?? {} })),
   }
   const dispose = ctx.slots.inject('settings.section', () => ctx.slots.register({
